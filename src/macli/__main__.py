@@ -125,6 +125,22 @@ def dprint(msg, style=None):
     if _VERBOSE:
         console.print(msg, style=style)
 
+def _raw_debug(msg: str):
+    """raw tty 模式下向 stderr 输出一行调试信息（\\r\\n 避免阶梯错位）。"""
+    if _VERBOSE:
+        os.write(sys.stderr.fileno(), f"\r\033[K\033[2m[dbg] {msg}\033[m\r\n".encode())
+
+def _status_debug(msg: str):
+    """将调试状态锁定在终端第一行原地刷新，不滚屏（光标 save/restore）。"""
+    if _VERBOSE:
+        try:
+            cols = os.get_terminal_size().columns
+        except OSError:
+            cols = 80
+        short = msg[:cols - 2]
+        os.write(sys.stderr.fileno(),
+                 f"\033[s\033[1;1H\033[K\033[2m{short}\033[m\033[u".encode())
+
 def load_session() -> dict:
     """从 config/session.json 读取 session"""
     try:
@@ -1992,9 +2008,9 @@ def cmd_shell(args):
     tasks = api.get_job_tasks(args.job_id)
     task_name = _pick_log_task(tasks, preferred=args.task)
 
-    cprint("[cyan]正在连接 CloudShell...[/cyan]")
+    dprint("[cyan]正在连接 CloudShell...[/cyan]")
     sock = _open_exec_ws(sess, args.job_id, task_name, command="/bin/bash")
-    cprint("[green]✓ 已连接[/green] [dim](退出热键: Ctrl-])[/dim]")
+    dprint("[green]✓ 已连接[/green] [dim](退出热键: Ctrl-])[/dim]")
     dprint(f"[dim][shell] heartbeat interval = {max(0.5, float(args.heartbeat))}s[/dim]")
 
     stop = {"value": False}
@@ -2010,22 +2026,34 @@ def cmd_shell(args):
                 except socket.timeout:
                     continue
                 if opcode == 8:
-                    dprint("[dim][shell] websocket close frame received[/dim]")
+                    _raw_debug("websocket close frame received")
                     break
                 if opcode in (1, 2) and payload:
                     # cloudShell 下行目前已确认主要是 0x01 + 终端字节流
                     if opcode == 2 and payload[:1] == b"\x01":
-                        if _VERBOSE:
-                            dprint(f"[dim][shell] recv frame: opcode={opcode} channel=01 len={len(payload)-1}[/dim]")
+                        _status_debug(f"recv frame: opcode={opcode} ch=01 len={len(payload)-1}")
                         payload = payload[1:]
-                    elif _VERBOSE:
-                        dprint(f"[dim][shell] recv frame: opcode={opcode} raw-len={len(payload)} head={payload[:8].hex()}[/dim]")
+                    else:
+                        _status_debug(f"recv frame: opcode={opcode} raw-len={len(payload)} head={payload[:8].hex()}")
                     if payload:
                         os.write(sys.stdout.fileno(), payload)
                         sys.stdout.flush()
         except Exception as e:
-            dprint(f"[red][shell] reader error: {type(e).__name__}: {e}[/red]")
+            _raw_debug(f"reader error: {type(e).__name__}: {e}")
         stop["value"] = True
+
+    _heart_toggle = {"on": True}
+
+    def _blink_heart():
+        sym = "♥" if _heart_toggle["on"] else "♡"
+        _heart_toggle["on"] = not _heart_toggle["on"]
+        try:
+            cols = os.get_terminal_size().columns
+        except OSError:
+            cols = 80
+        # Save cursor → jump to top-right → print heart → restore cursor
+        indicator = f"\033[s\033[1;{cols}H\033[31m{sym}\033[m\033[u"
+        os.write(sys.stderr.fileno(), indicator.encode())
 
     def heartbeat_sender():
         try:
@@ -2036,13 +2064,14 @@ def cmd_shell(args):
                     break
                 try:
                     _ws_send_frame(sock, b"\x00", opcode=2)
-                    dprint(f"[dim][shell] heartbeat sent: channel=0 len=0 t={time.strftime('%H:%M:%S')}[/dim]")
+                    if _VERBOSE:
+                        _blink_heart()
                 except Exception as e:
-                    dprint(f"[red][shell] heartbeat failed: {type(e).__name__}: {e}[/red]")
+                    _raw_debug(f"heartbeat failed: {type(e).__name__}: {e}")
                     stop["value"] = True
                     break
         except Exception as e:
-            dprint(f"[red][shell] heartbeat thread error: {type(e).__name__}: {e}[/red]")
+            _raw_debug(f"heartbeat thread error: {type(e).__name__}: {e}")
 
     t = threading.Thread(target=reader, daemon=True)
     t.start()
@@ -2064,24 +2093,21 @@ def cmd_shell(args):
         try:
             sz = os.get_terminal_size()
             _send_resize(sock, sz.columns, sz.lines)
-            dprint(f"[dim][shell] initial resize sent: {sz.columns}x{sz.lines}[/dim]")
+            _raw_debug(f"initial resize sent: {sz.columns}x{sz.lines}")
         except Exception as e:
-            dprint(f"[red][shell] resize send failed: {type(e).__name__}: {e}[/red]")
+            _raw_debug(f"resize send failed: {type(e).__name__}: {e}")
         # 打开 stdin 通道；不主动补回车，避免重复打印 prompt
         try:
             _ws_send_frame(sock, b"\x00", opcode=2)
-            dprint("[dim][shell] init stdin frame sent[/dim]")
+            _raw_debug("init stdin frame sent")
         except Exception as e:
-            dprint(f"[red][shell] init send failed: {type(e).__name__}: {e}[/red]")
+            _raw_debug(f"init send failed: {type(e).__name__}: {e}")
         while not stop["value"]:
             r, _, _ = select.select([sys.stdin.fileno()], [], [], 0.1)
             if not r:
                 continue
             data = os.read(sys.stdin.fileno(), 1)
             if not data:
-                break
-            if data == b'\x1d':  # Ctrl-]
-                stop["value"] = True
                 break
             # cloudShell 上行消息格式：0x00 + stdin字节
             _ws_send_frame(sock, b"\x00" + data, opcode=2)
@@ -2096,7 +2122,7 @@ def cmd_shell(args):
             sock.close()
         except Exception:
             pass
-        cprint("\n[dim]CloudShell 已退出[/dim]")
+        dprint("\n[dim]CloudShell 已退出[/dim]")
 
 
 def cmd_copy(args):
