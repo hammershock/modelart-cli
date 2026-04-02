@@ -4,7 +4,7 @@
 author: @hammershock
 version: 0.0.1
 """
-import os, sys, json, time, re, copy, argparse, subprocess as _subprocess, tempfile, shutil, ssl, socket, base64, struct, urllib.parse, threading, tty, termios, select
+import os, sys, json, time, re, copy, argparse, subprocess as _subprocess, tempfile, shutil, ssl, socket, base64, struct, urllib.parse, threading, tty, termios, select, signal
 from pathlib import Path
 from datetime import datetime
 
@@ -1973,6 +1973,11 @@ def _open_exec_ws(sess: ConsoleSession, job_id: str, task_name: str, command: st
     return sock
 
 
+def _send_resize(sock, cols: int, rows: int):
+    msg = json.dumps({"Width": cols, "Height": rows}).encode()
+    _ws_send_frame(sock, b"\x04" + msg, opcode=2)
+
+
 def cmd_shell(args):
     sess = _sess_or_exit()
     api  = API(sess)
@@ -2044,8 +2049,24 @@ def cmd_shell(args):
     hb = threading.Thread(target=heartbeat_sender, daemon=True)
     hb.start()
 
+    old_sigwinch = signal.getsignal(signal.SIGWINCH)
+
+    def _on_resize(signum, frame):
+        try:
+            sz = os.get_terminal_size()
+            _send_resize(sock, sz.columns, sz.lines)
+        except Exception:
+            pass
+
     try:
         tty.setraw(sys.stdin.fileno())
+        signal.signal(signal.SIGWINCH, _on_resize)
+        try:
+            sz = os.get_terminal_size()
+            _send_resize(sock, sz.columns, sz.lines)
+            dprint(f"[dim][shell] initial resize sent: {sz.columns}x{sz.lines}[/dim]")
+        except Exception as e:
+            dprint(f"[red][shell] resize send failed: {type(e).__name__}: {e}[/red]")
         # 打开 stdin 通道；不主动补回车，避免重复打印 prompt
         try:
             _ws_send_frame(sock, b"\x00", opcode=2)
@@ -2065,6 +2086,7 @@ def cmd_shell(args):
             # cloudShell 上行消息格式：0x00 + stdin字节
             _ws_send_frame(sock, b"\x00" + data, opcode=2)
     finally:
+        signal.signal(signal.SIGWINCH, old_sigwinch)
         termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_tty)
         try:
             _ws_send_frame(sock, b"\x00exit\r", opcode=2)
