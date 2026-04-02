@@ -4,7 +4,7 @@
 author: @hammershock
 version: 0.0.1
 """
-import os, sys, json, time, re, copy, argparse, subprocess as _subprocess, tempfile, shutil
+import os, sys, json, time, re, copy, argparse, subprocess as _subprocess, tempfile, shutil, ssl, socket, base64, struct, urllib.parse, threading, tty, termios, select
 from pathlib import Path
 from datetime import datetime
 
@@ -64,6 +64,7 @@ try:
     from rich.syntax import Syntax
 except Exception:
     Syntax = None
+
 
 class SessionExpiredError(Exception):
     """登录凭据已过期，需要重新登录"""
@@ -467,8 +468,21 @@ class API:
         cprint(f"[red]详情失败 {r.status_code}: {r.text[:200]}[/red]")
         return {}
 
-    def get_job_events(self, job_id: str, limit: int = 50, offset: int = 0) -> dict:
-        r = self.sess.get(f"/training-jobs/{job_id}/events", limit=limit, offset=offset)
+    def get_job_events(self, job_id: str, limit: int = 50, offset: int = 0,
+                       start_time=None, end_time=None, order: str = "desc",
+                       pattern: str = "", level: str = "") -> dict:
+        params = {
+            "limit": limit,
+            "offset": offset,
+            "order": order,
+            "pattern": pattern,
+            "level": level,
+        }
+        if start_time is not None:
+            params["start_time"] = start_time
+        if end_time is not None:
+            params["end_time"] = end_time
+        r = self.sess.get(f"/training-jobs/{job_id}/events", **params)
         if r.status_code == 200:
             return self._safe_json(r)
         cprint(f"[red]事件查询失败 {r.status_code}: {r.text[:200]}[/red]")
@@ -505,6 +519,40 @@ class API:
             stream=True,
             allow_redirects=True,
         )
+
+    def query_usage_range(self, query: str, start: int, end: int, step: int = 60) -> dict:
+        url = (
+            f"https://console.huaweicloud.com/modelarts/rest/api/aompod/v1/"
+            f"{self.sess.project_id}/aom/api/v1/query_range"
+        )
+        payload = {"query": query, "start": start, "end": end, "step": step}
+        headers = {
+            "accept": "application/json, text/plain, */*",
+            "content-type": "application/json;charset=UTF-8",
+            "origin": "https://console.huaweicloud.com",
+            "referer": "https://console.huaweicloud.com/",
+            "user-agent": "Mozilla/5.0",
+            "region": self.sess.region,
+            "projectname": self.sess.region,
+            "agencyid": self.sess.agency_id,
+            "cftk": self.sess.cftk,
+            "cf2-cftk": "cftk",
+        }
+        http = _new_session()
+        for c in self.sess.http.cookies:
+            http.cookies.set(c.name, c.value)
+        r = http.post(url, params=payload, json=payload, headers=headers, timeout=30)
+        if r.status_code == 200:
+            return self._safe_json(r)
+        cprint(f"[red]usage 查询失败 {r.status_code}: {r.text[:200]}[/red]")
+        return {}
+
+    def get_exec_status(self, job_id: str) -> dict:
+        r = self.sess.get(f"/training-jobs/{job_id}/exec/status")
+        if r.status_code == 200:
+            return self._safe_json(r)
+        cprint(f"[red]CloudShell 状态查询失败 {r.status_code}: {r.text[:200]}[/red]")
+        return {}
 
     # flavor_id 对应卡数
     FLAVOR_MAP = {
@@ -1479,7 +1527,22 @@ def cmd_events(args):
     sess = _sess_or_exit()
     api  = API(sess)
 
-    data = api.get_job_events(args.job_id, limit=args.limit, offset=args.offset)
+    job = api.get_job(args.job_id)
+    if not job:
+        sys.exit(1)
+    create_time = (job.get("metadata", {}) or {}).get("create_time")
+    end_time = int(time.time() * 1000)
+
+    data = api.get_job_events(
+        args.job_id,
+        limit=args.limit,
+        offset=args.offset,
+        start_time=create_time,
+        end_time=end_time,
+        order="desc",
+        pattern="",
+        level="",
+    )
     if not data:
         sys.exit(1)
 
@@ -1620,6 +1683,398 @@ def cmd_log(args):
     cprint(f"[green]✓ 日志已导出[/green] {outpath} [dim]({size} bytes)[/dim]")
     cprint(f"[dim]job={args.job_id}  task={task_name}[/dim]")
 
+
+def _build_usage_query(metric_name: str, job_id: str, window_ms: int = 59999) -> str:
+    return (
+        f'avg(label_replace(avg_over_time({metric_name}'
+        f'{{service_id="{job_id}",container_name="modelarts-training"}}'
+        f'[{window_ms}ms]),"__name__","{metric_name}","",""))by(__name__,service_id)'
+    )
+
+
+def _usage_series_stats(values: list) -> dict:
+    pairs = []
+    for item in values or []:
+        try:
+            ts = int(item[0])
+            val = float(item[1])
+            pairs.append((ts, val))
+        except Exception:
+            continue
+    if not pairs:
+        return {"count": 0, "latest": None, "avg": None, "max": None}
+    only_vals = [v for _, v in pairs]
+    return {
+        "count": len(pairs),
+        "latest": pairs[-1][1],
+        "avg": sum(only_vals) / len(only_vals),
+        "max": max(only_vals),
+        "start": pairs[0][0],
+        "end": pairs[-1][0],
+        "values": pairs,
+    }
+
+
+def _fmt_usage_value(metric_key: str, val):
+    if val is None:
+        return "--"
+    if metric_key in {"cpu_util", "memory_util", "gpu_util", "gpu_mem_util"}:
+        return f"{val * 100:.2f}%"
+    if metric_key == "cpu_used_core":
+        return f"{val:.4f} cores"
+    if metric_key in {"memory_used_megabytes", "gpu_mem_used_megabytes"}:
+        return f"{val:.2f} MB"
+    return str(val)
+
+
+def _sparkline(values: list, width: int = 32) -> str:
+    ticks = "▁▂▃▄▅▆▇█"
+    vals = []
+    for item in values or []:
+        try:
+            vals.append(float(item[1] if isinstance(item, (list, tuple)) and len(item) >= 2 else item))
+        except Exception:
+            continue
+    if not vals:
+        return "·" * width
+    if len(vals) > width:
+        step = len(vals) / width
+        sampled = []
+        for i in range(width):
+            idx = min(int(i * step), len(vals) - 1)
+            sampled.append(vals[idx])
+        vals = sampled
+    elif len(vals) < width:
+        vals = [vals[0]] * (width - len(vals)) + vals
+    vmin, vmax = min(vals), max(vals)
+    if vmax - vmin < 1e-12:
+        level = 0 if vmax <= 0 else len(ticks) // 2
+        return ticks[level] * len(vals)
+    chars = []
+    for v in vals:
+        idx = int(round((v - vmin) / (vmax - vmin) * (len(ticks) - 1)))
+        idx = max(0, min(len(ticks) - 1, idx))
+        chars.append(ticks[idx])
+    return "".join(chars)
+
+
+def _usage_panel_text(result: dict) -> str:
+    m = result["metrics"]
+    lines = []
+    rows = [
+        ("CPU", "cpu_util", "cpu_used_core"),
+        ("内存", "memory_util", "memory_used_megabytes"),
+        ("GPU", "gpu_util", "gpu_mem_used_megabytes"),
+        ("显存", "gpu_mem_util", "gpu_mem_used_megabytes"),
+    ]
+    start_ts = None
+    end_ts = None
+    for title, util_key, used_key in rows:
+        util = m.get(util_key, {})
+        used = m.get(used_key, {})
+        if start_ts is None and util.get("start"):
+            start_ts = util.get("start")
+        if util.get("end"):
+            end_ts = util.get("end")
+        latest_util = util.get("latest")
+        percent = f"{latest_util * 100:.1f}%" if latest_util is not None else "--"
+        latest_used = _fmt_usage_value(used_key, used.get("latest"))
+        avg_used = _fmt_usage_value(used_key, used.get("avg"))
+        trend = _sparkline(util.get("values", []), width=36)
+        color = 'green' if (latest_util or 0) < 0.5 else 'yellow' if (latest_util or 0) < 0.8 else 'red'
+        lines.append(f"[bold]{title:<4}[/bold] [{color}]{trend}[/{color}] {percent}")
+        lines.append(f"      latest={latest_used}   avg={avg_used}")
+    if start_ts and end_ts:
+        from datetime import datetime as _dt
+        st = _dt.fromtimestamp(start_ts).strftime('%H:%M')
+        ed = _dt.fromtimestamp(end_ts).strftime('%H:%M')
+        lines.append("")
+        lines.append(f"[dim]{st} {'─' * 34} {ed}[/dim]")
+    return "\n".join(lines)
+
+
+def _fetch_usage_result(api: API, job_id: str, minutes: int, step: int) -> dict:
+    end_ts = int(time.time())
+    start_ts = end_ts - int(minutes) * 60
+    metrics = {
+        "cpu_used_core": "ma_container_cpu_used_core",
+        "cpu_util": "ma_container_cpu_util",
+        "memory_used_megabytes": "ma_container_memory_used_megabytes",
+        "memory_util": "ma_container_memory_util",
+        "gpu_util": "ma_container_gpu_util",
+        "gpu_mem_used_megabytes": "ma_container_gpu_mem_used_megabytes",
+        "gpu_mem_util": "ma_container_gpu_mem_util",
+    }
+    result = {
+        "job_id": job_id,
+        "minutes": minutes,
+        "step": step,
+        "metrics": {},
+    }
+    for key, metric_name in metrics.items():
+        query = _build_usage_query(metric_name, job_id)
+        data = api.query_usage_range(query=query, start=start_ts, end=end_ts, step=step)
+        series = (((data or {}).get("data") or {}).get("result") or [])
+        values = (series[0].get("values") if series else []) or []
+        result["metrics"][key] = _usage_series_stats(values)
+    return result
+
+
+def cmd_usage(args):
+    sess = _sess_or_exit()
+    api  = API(sess)
+
+    if args.job_id:
+        result = _fetch_usage_result(api, args.job_id, args.minutes, args.step)
+        if getattr(args, "json", False):
+            _json_out(result)
+            return
+        console.print(Panel(
+            _usage_panel_text(result),
+            title=f"作业监控  {args.job_id}",
+            border_style="cyan",
+        ))
+        cprint(f"[dim]时间范围: 最近 {args.minutes} 分钟，step={args.step}s[/dim]")
+        return
+
+    jobs = api.list_jobs(limit=args.limit).get("items", [])
+    running_jobs = [j for j in jobs if j.get("status", {}).get("phase") == "Running"]
+    rows = []
+    for job in running_jobs:
+        meta = job.get("metadata", {})
+        job_id = meta.get("id", "")
+        name = meta.get("name", "")
+        u = _fetch_usage_result(api, job_id, args.minutes, args.step)
+        rows.append({
+            "job_id": job_id,
+            "name": name,
+            "cpu": u["metrics"].get("cpu_util", {}).get("latest"),
+            "mem": u["metrics"].get("memory_used_megabytes", {}).get("latest"),
+            "gpu": u["metrics"].get("gpu_util", {}).get("latest"),
+            "gpu_mem": u["metrics"].get("gpu_mem_used_megabytes", {}).get("latest"),
+        })
+
+    if getattr(args, "json", False):
+        _json_out({
+            "minutes": args.minutes,
+            "step": args.step,
+            "jobs": rows,
+        })
+        return
+
+    t = Table(title="Running 作业最近 usage", header_style="bold cyan")
+    t.add_column("名称", style="green")
+    t.add_column("JOB_ID", style="dim")
+    t.add_column("CPU")
+    t.add_column("内存")
+    t.add_column("GPU")
+    t.add_column("显存")
+    for row in rows:
+        t.add_row(
+            row["name"],
+            row["job_id"],
+            _fmt_usage_value("cpu_util", row["cpu"]),
+            _fmt_usage_value("memory_used_megabytes", row["mem"]),
+            _fmt_usage_value("gpu_util", row["gpu"]),
+            _fmt_usage_value("gpu_mem_used_megabytes", row["gpu_mem"]),
+        )
+    console.print(t)
+    cprint(f"[dim]仅显示 Running 作业最近 usage；时间范围: 最近 {args.minutes} 分钟，step={args.step}s[/dim]")
+
+
+
+def _ws_recv_exact(sock, n: int) -> bytes:
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise EOFError("socket closed")
+        buf += chunk
+    return buf
+
+
+def _ws_read_frame(sock):
+    b1, b2 = _ws_recv_exact(sock, 2)
+    opcode = b1 & 0x0F
+    masked = (b2 >> 7) & 1
+    length = b2 & 0x7F
+    if length == 126:
+        length = struct.unpack("!H", _ws_recv_exact(sock, 2))[0]
+    elif length == 127:
+        length = struct.unpack("!Q", _ws_recv_exact(sock, 8))[0]
+    mask = b""
+    if masked:
+        mask = _ws_recv_exact(sock, 4)
+    payload = _ws_recv_exact(sock, length) if length else b""
+    if masked:
+        payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    return opcode, payload
+
+
+def _ws_send_frame(sock, payload: bytes, opcode: int = 2):
+    fin_opcode = 0x80 | (opcode & 0x0F)
+    mask_bit = 0x80
+    n = len(payload)
+    header = bytearray([fin_opcode])
+    if n < 126:
+        header.append(mask_bit | n)
+    elif n < (1 << 16):
+        header.append(mask_bit | 126)
+        header.extend(struct.pack("!H", n))
+    else:
+        header.append(mask_bit | 127)
+        header.extend(struct.pack("!Q", n))
+    mask_key = os.urandom(4)
+    header.extend(mask_key)
+    masked = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+    sock.sendall(bytes(header) + masked)
+
+
+def _open_exec_ws(sess: ConsoleSession, job_id: str, task_name: str, command: str = "/bin/bash"):
+    host = "console.huaweicloud.com"
+    path = (
+        f"/modelarts/rest/v2/{sess.project_id}/training-jobs/{job_id}/exec"
+        f"?task_id={urllib.parse.quote(task_name)}&command={urllib.parse.quote(command)}"
+    )
+    proto = (
+        f"origin|https%3A%2F%2Fconsole.huaweicloud.com, "
+        f"cftk|{sess.cftk or ''}, "
+        f"agencyid|{sess.agency_id or ''}, "
+        f"projectname|{sess.region or ''}, "
+        f"region|{sess.region or ''}"
+    )
+    key = base64.b64encode(os.urandom(16)).decode()
+    cookie = "; ".join(f"{c.name}={c.value}" for c in sess.http.cookies)
+    req = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {host}\r\n"
+        f"Upgrade: websocket\r\n"
+        f"Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        f"Sec-WebSocket-Version: 13\r\n"
+        f"Sec-WebSocket-Protocol: {proto}\r\n"
+        f"Origin: https://console.huaweicloud.com\r\n"
+        f"User-Agent: Mozilla/5.0\r\n"
+        f"Cookie: {cookie}\r\n"
+        f"\r\n"
+    )
+    ctx = ssl.create_default_context()
+    raw_sock = socket.create_connection((host, 443), timeout=10)
+    sock = ctx.wrap_socket(raw_sock, server_hostname=host)
+    sock.sendall(req.encode())
+    resp = b""
+    while b"\r\n\r\n" not in resp:
+        resp += sock.recv(4096)
+    header = resp.split(b"\r\n\r\n", 1)[0].decode("utf-8", errors="replace")
+    if "101 Switching Protocols" not in header:
+        sock.close()
+        raise RuntimeError(f"CloudShell websocket 握手失败: {header[:300]}")
+    sock.settimeout(2)
+    return sock
+
+
+def cmd_shell(args):
+    sess = _sess_or_exit()
+    api  = API(sess)
+
+    status = api.get_exec_status(args.job_id)
+    if status and isinstance(status, dict):
+        access = (status.get("access") or {}).get("allow")
+        if access is False:
+            cprint("[red]该作业当前不允许打开 CloudShell[/red]")
+            sys.exit(1)
+
+    tasks = api.get_job_tasks(args.job_id)
+    task_name = _pick_log_task(tasks, preferred=args.task)
+
+    cprint("[cyan]正在连接 CloudShell...[/cyan]")
+    sock = _open_exec_ws(sess, args.job_id, task_name, command="/bin/bash")
+    cprint("[green]✓ 已连接[/green] [dim](退出热键: Ctrl-])[/dim]")
+    dprint(f"[dim][shell] heartbeat interval = {max(0.5, float(args.heartbeat))}s[/dim]")
+
+    stop = {"value": False}
+    old_tty = termios.tcgetattr(sys.stdin.fileno())
+
+    def reader():
+        try:
+            while not stop["value"]:
+                try:
+                    opcode, payload = _ws_read_frame(sock)
+                except TimeoutError:
+                    continue
+                except socket.timeout:
+                    continue
+                if opcode == 8:
+                    dprint("[dim][shell] websocket close frame received[/dim]")
+                    break
+                if opcode in (1, 2) and payload:
+                    # cloudShell 下行目前已确认主要是 0x01 + 终端字节流
+                    if opcode == 2 and payload[:1] == b"\x01":
+                        if _VERBOSE:
+                            dprint(f"[dim][shell] recv frame: opcode={opcode} channel=01 len={len(payload)-1}[/dim]")
+                        payload = payload[1:]
+                    elif _VERBOSE:
+                        dprint(f"[dim][shell] recv frame: opcode={opcode} raw-len={len(payload)} head={payload[:8].hex()}[/dim]")
+                    if payload:
+                        os.write(sys.stdout.fileno(), payload)
+                        sys.stdout.flush()
+        except Exception as e:
+            dprint(f"[red][shell] reader error: {type(e).__name__}: {e}[/red]")
+        stop["value"] = True
+
+    def heartbeat_sender():
+        try:
+            interval = max(0.5, float(args.heartbeat))
+            while not stop["value"]:
+                time.sleep(interval)
+                if stop["value"]:
+                    break
+                try:
+                    _ws_send_frame(sock, b"\x00", opcode=2)
+                    dprint(f"[dim][shell] heartbeat sent: channel=0 len=0 t={time.strftime('%H:%M:%S')}[/dim]")
+                except Exception as e:
+                    dprint(f"[red][shell] heartbeat failed: {type(e).__name__}: {e}[/red]")
+                    stop["value"] = True
+                    break
+        except Exception as e:
+            dprint(f"[red][shell] heartbeat thread error: {type(e).__name__}: {e}[/red]")
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+    hb = threading.Thread(target=heartbeat_sender, daemon=True)
+    hb.start()
+
+    try:
+        tty.setraw(sys.stdin.fileno())
+        # 打开 stdin 通道；不主动补回车，避免重复打印 prompt
+        try:
+            _ws_send_frame(sock, b"\x00", opcode=2)
+            dprint("[dim][shell] init stdin frame sent[/dim]")
+        except Exception as e:
+            dprint(f"[red][shell] init send failed: {type(e).__name__}: {e}[/red]")
+        while not stop["value"]:
+            r, _, _ = select.select([sys.stdin.fileno()], [], [], 0.1)
+            if not r:
+                continue
+            data = os.read(sys.stdin.fileno(), 1)
+            if not data:
+                break
+            if data == b'\x1d':  # Ctrl-]
+                stop["value"] = True
+                break
+            # cloudShell 上行消息格式：0x00 + stdin字节
+            _ws_send_frame(sock, b"\x00" + data, opcode=2)
+    finally:
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_tty)
+        try:
+            _ws_send_frame(sock, b"\x00exit\r", opcode=2)
+        except Exception:
+            pass
+        try:
+            sock.close()
+        except Exception:
+            pass
+        cprint("\n[dim]CloudShell 已退出[/dim]")
 
 
 def cmd_copy(args):
@@ -1821,6 +2276,8 @@ macli detail --name <JOB_NAME> [--json]
 
 macli events <JOB_ID> [--limit LIMIT] [--offset OFFSET] [--json]
 macli log <JOB_ID> --output <OUTPUT_PATH> [--task TASK]
+macli usage [<JOB_ID>] [--minutes N] [--step N] [--json]
+macli shell <JOB_ID> [--task TASK]
 
 macli copy <JOB_ID> [options...] [-y | --yes] [--json]
 macli copy --src-name <SRC_NAME> [options...] [-y | --yes] [--json]
@@ -1910,6 +2367,18 @@ macli delete <JOB_ID> [-y | --yes] [-f | --force]  # -f/--force 会强制删除�
     q.add_argument("--output", required=True, help="输出文件路径")
     q.add_argument("--json", action="store_true", help="仅输出解析到的任务信息（调试用）")
 
+    q = sub.add_parser("usage", help="查看作业资源使用监控")
+    q.add_argument("job_id", metavar="JOB_ID", nargs="?", default=None, help="作业 ID；不填则列出所有 Running 作业最近 usage")
+    q.add_argument("--minutes", type=int, default=15, help="最近多少分钟，默认 15")
+    q.add_argument("--step", type=int, default=60, help="采样步长（秒），默认 60")
+    q.add_argument("--limit", type=int, default=50, help="无 JOB_ID 时，最多检查多少个作业，默认 50")
+    q.add_argument("--json", action="store_true", help="JSON 输出")
+
+    q = sub.add_parser("shell", help="打开作业 CloudShell 交互终端")
+    q.add_argument("job_id", metavar="JOB_ID", help="作业 ID")
+    q.add_argument("--task", default=None, help="任务名，例如 worker-0；默认自动选择")
+    q.add_argument("--heartbeat", type=float, default=2.0, help="空闲时发送心跳包的间隔秒数，默认 2")
+
     q = sub.add_parser("copy", help="复制训练作业",
                        formatter_class=argparse.RawDescriptionHelpFormatter,
                        epilog="""
@@ -1969,6 +2438,8 @@ macli delete <JOB_ID> [-y | --yes] [-f | --force]  # -f/--force 会强制删除�
          "detail":    cmd_detail,
          "events":    cmd_events,
          "log":       cmd_log,
+         "usage":     cmd_usage,
+         "shell":     cmd_shell,
          "copy":      cmd_copy,
          "stop":      cmd_stop,
          "delete":    cmd_delete}[args.cmd](args)
