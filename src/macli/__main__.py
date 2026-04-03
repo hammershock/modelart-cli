@@ -1889,14 +1889,178 @@ def _fetch_usage_result(api: API, job_id: str, minutes: int, step: int) -> dict:
     return result
 
 
+# ── Probe system (CloudShell-based remote metric collection) ──────────────────
+#
+# 每个 ProbeSpec 封装一个资源维度的探测：shell 脚本 + 输出解析。
+# 所有激活的探针合并进一个脚本，通过单次 exec 连接完成采集。
+# 新增平台/指标只需在 _PROBE_REGISTRY 里追加新条目即可。
+
+def _probe_kv(text: str) -> dict:
+    """解析 'key=value' 行，值转 float（失败则跳过）。"""
+    result = {}
+    for line in text.splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            try:
+                result[k.strip()] = float(v.strip())
+            except ValueError:
+                pass
+    return result
+
+
+def _probe_metric(val) -> dict:
+    """将单个采样值包装成与 _usage_series_stats 兼容的 metrics 格式。"""
+    if val is None:
+        return {"count": 0, "latest": None, "avg": None, "max": None, "values": []}
+    v = float(val)
+    return {"count": 1, "latest": v, "avg": v, "max": v, "values": []}
+
+
+class _ProbeSpec:
+    """单个探针规格：探测哪些 filter_keys、执行什么 shell、如何解析输出。"""
+    def __init__(self, key: str, filter_keys, shell: str, parse_fn):
+        self.key         = key
+        self.filter_keys = frozenset(filter_keys)
+        self.shell       = shell.strip()
+        self.parse_fn    = parse_fn   # (kv: dict) -> {metric_key: metric_dict}
+
+
+# ── 各平台/指标的探针定义 ────────────────────────────────────────────────────
+
+def _probe_parse_cpu(kv: dict) -> dict:
+    return {
+        "cpu_util":      _probe_metric(kv.get("cpu_util")),
+        "cpu_used_core": _probe_metric(None),
+    }
+
+def _probe_parse_mem(kv: dict) -> dict:
+    return {
+        "memory_util":           _probe_metric(kv.get("mem_util")),
+        "memory_used_megabytes": _probe_metric(kv.get("mem_used_mb")),
+    }
+
+def _probe_parse_gpu(kv: dict) -> dict:
+    return {
+        "gpu_util":               _probe_metric(kv.get("gpu_util")),
+        "gpu_mem_util":           _probe_metric(kv.get("vram_util")),
+        "gpu_mem_used_megabytes": _probe_metric(kv.get("vram_used_mb")),
+    }
+
+
+_PROBE_REGISTRY: "list[_ProbeSpec]" = [
+    _ProbeSpec(
+        key="cpu",
+        filter_keys={"cpu"},
+        shell=r"""
+cpu_s(){ awk '/^cpu /{printf "%d %d\n",$2+$3+$4+$5+$6+$7+$8,$5+$6}' /proc/stat; }
+read s1 i1 < <(cpu_s); sleep 0.3; read s2 i2 < <(cpu_s)
+ds=$((s2-s1)); di=$((i2-i1))
+awk "BEGIN{u=($ds>0)?($ds-$di)/$ds:0; printf \"cpu_util=%.6f\n\",u}"
+""",
+        parse_fn=_probe_parse_cpu,
+    ),
+    _ProbeSpec(
+        key="mem",
+        filter_keys={"mem"},
+        shell=r"""
+awk '/MemTotal:/{t=$2}/MemAvailable:/{a=$2} \
+    END{u=t-a; printf "mem_used_mb=%.2f\nmem_util=%.6f\n", u/1024, (t>0)?u/t:0}' \
+    /proc/meminfo
+""",
+        parse_fn=_probe_parse_mem,
+    ),
+    _ProbeSpec(
+        key="gpu",
+        filter_keys={"gpu", "vram"},
+        # nvidia-smi 不可用时输出全零，平均多卡利用率/显存
+        shell=r"""
+if command -v nvidia-smi &>/dev/null; then
+    nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total \
+        --format=csv,noheader,nounits 2>/dev/null | \
+    awk -F'[, ]+' '
+        {gu+=$1; vm+=$2; vt+=$3; n++}
+        END{if(n>0) printf "gpu_util=%.6f\nvram_used_mb=%.2f\nvram_util=%.6f\n",
+                           gu/100/n, vm/n, (vt>0)?vm/vt:0;
+            else      print "gpu_util=0\nvram_used_mb=0\nvram_util=0"}'
+else
+    printf "gpu_util=0\nvram_used_mb=0\nvram_util=0\n"
+fi
+""",
+        parse_fn=_probe_parse_gpu,
+    ),
+]
+
+
+def _run_probes(
+    sess: "ConsoleSession",
+    job_id: str,
+    task_name: str,
+    filter_set: set,
+    timeout: int = 60,
+) -> dict:
+    """
+    将 filter_set 对应的所有探针合并为一个脚本，经单次 exec 连接执行，
+    返回与 _fetch_usage_result 格式兼容的 result dict。
+    """
+    active = [p for p in _PROBE_REGISTRY if p.filter_keys & filter_set]
+    if not active:
+        return {"job_id": job_id, "probe": True, "metrics": {}}
+
+    PSTART = "MACLI_PROBE_START"
+    PEND   = "MACLI_PROBE_END"
+
+    script_parts = ["#!/bin/bash"]
+    for p in active:
+        script_parts.append(f'echo "{PSTART}:{p.key}"')
+        script_parts.append(p.shell)
+        script_parts.append(f'echo "{PEND}:{p.key}"')
+    script = "\n".join(script_parts)
+
+    dprint(f"[dim]probe: 运行 {[p.key for p in active]} (单次连接)[/dim]")
+    output, _ = _exec_script(sess, job_id, task_name, script, timeout=timeout)
+    _raw_debug(f"probe raw output:\n{output}")
+
+    metrics: dict = {}
+    for p in active:
+        section = ""
+        s_mark = f"{PSTART}:{p.key}"
+        e_mark = f"{PEND}:{p.key}"
+        if s_mark in output:
+            after = output.split(s_mark, 1)[1]
+            section = after.split(e_mark, 1)[0] if e_mark in after else after
+        kv = _probe_kv(section)
+        dprint(f"[dim]probe [{p.key}] kv={kv}[/dim]")
+        metrics.update(p.parse_fn(kv))
+
+    return {"job_id": job_id, "probe": True, "metrics": metrics}
+
+
+def _usage_check_exec_access(api: "API", job_id: str) -> str:
+    """检查 CloudShell 权限并返回 task_name，失败则 exit。"""
+    status = api.get_exec_status(job_id)
+    if status and isinstance(status, dict):
+        access = (status.get("access") or {}).get("allow")
+        if access is False:
+            cprint("[red]该作业 CloudShell 未就绪，无法使用 --probe[/red]")
+            sys.exit(1)
+    tasks = api.get_job_tasks(job_id)
+    return _pick_log_task(tasks)
+
+
 def cmd_usage(args):
     sess = _sess_or_exit()
     api  = API(sess)
 
     filter_set = _parse_metrics_filter(getattr(args, "metrics", None) or [])
+    use_probe  = getattr(args, "probe", False)
 
     if args.job_id:
-        result = _fetch_usage_result(api, args.job_id, args.minutes, args.step)
+        if use_probe:
+            task_name = _usage_check_exec_access(api, args.job_id)
+            result = _run_probes(sess, args.job_id, task_name, filter_set,
+                                 timeout=getattr(args, "timeout", 60))
+        else:
+            result = _fetch_usage_result(api, args.job_id, args.minutes, args.step)
         if getattr(args, "json", False):
             _json_out(result)
             return
@@ -1915,7 +2079,12 @@ def cmd_usage(args):
         meta = job.get("metadata", {})
         job_id = meta.get("id", "")
         name = meta.get("name", "")
-        u = _fetch_usage_result(api, job_id, args.minutes, args.step)
+        if use_probe:
+            task_name = _usage_check_exec_access(api, job_id)
+            u = _run_probes(sess, job_id, task_name, filter_set,
+                            timeout=getattr(args, "timeout", 60))
+        else:
+            u = _fetch_usage_result(api, job_id, args.minutes, args.step)
         rows.append({
             "job_id": job_id,
             "name": name,
@@ -2180,6 +2349,113 @@ def cmd_shell(args):
         dprint("\n[dim]CloudShell 已退出[/dim]")
 
 
+def _exec_script(
+    sess: "ConsoleSession",
+    job_id: str,
+    task_name: str,
+    script: str,
+    timeout: int = 120,
+    cwd: str = None,
+) -> "tuple[str, int]":
+    """
+    底层传输：通过 CloudShell WebSocket 执行 script，返回 (stdout文本, exit_code)。
+    脚本经 base64 编码传输，支持多行/特殊字符/heredoc 等任意内容。
+    """
+    import base64 as _b64
+    script_b64 = _b64.b64encode(script.encode()).decode()
+
+    START_MARKER = "MACLI_EXEC_START_7f3a9"
+    EXIT_MARKER  = "MACLI_EXEC_EXIT_7f3a9"
+    TMP_B64      = "/tmp/.macli_exec_b64_$$"
+
+    CHUNK = 512
+    chunks = [script_b64[i:i+CHUNK] for i in range(0, len(script_b64), CHUNK)]
+
+    setup_lines = [
+        "stty -echo; PS1=''; PS2=''\r",
+        f"TMP={TMP_B64}; rm -f \"$TMP\"\r",
+    ]
+    for ch in chunks:
+        setup_lines.append(f"printf '%s' '{ch}' >> \"$TMP\"\r")
+
+    run_parts = ["base64 -d \"$TMP\" | bash"]
+    if cwd:
+        cwd_esc = cwd.replace("'", "'\\''")
+        run_parts = [f"cd '{cwd_esc}' &&"] + run_parts
+
+    setup_lines.append(
+        f"echo {START_MARKER}; "
+        + " ".join(run_parts)
+        + f"; echo {EXIT_MARKER}:$?; rm -f \"$TMP\"; exit\r"
+    )
+
+    sock = _open_exec_ws(sess, job_id, task_name, command="/bin/bash")
+
+    buf       = bytearray()
+    exit_code = [None]
+    done      = threading.Event()
+
+    def _reader():
+        try:
+            while not done.is_set():
+                try:
+                    opcode, payload = _ws_read_frame(sock)
+                except (TimeoutError, socket.timeout):
+                    continue
+                if opcode == 8:
+                    break
+                if opcode in (1, 2) and payload:
+                    if opcode == 2 and payload[:1] == b"\x01":
+                        payload = payload[1:]
+                    if payload:
+                        buf.extend(payload)
+                        if EXIT_MARKER.encode() in buf:
+                            m = re.search(rf"{EXIT_MARKER}:(\d+)",
+                                          buf.decode("utf-8", errors="replace"))
+                            if m:
+                                exit_code[0] = int(m.group(1))
+                            done.set()
+        except Exception as e:
+            _raw_debug(f"_exec_script reader: {type(e).__name__}: {e}")
+        done.set()
+
+    def _heartbeat():
+        while not done.is_set():
+            done.wait(timeout=5)
+            if done.is_set():
+                break
+            try:
+                _ws_send_frame(sock, b"\x00", opcode=2)
+            except Exception:
+                break
+
+    threading.Thread(target=_reader,    daemon=True).start()
+    threading.Thread(target=_heartbeat, daemon=True).start()
+
+    time.sleep(0.4)
+    for line in setup_lines:
+        _ws_send_frame(sock, b"\x00" + line.encode(), opcode=2)
+        time.sleep(0.02)
+
+    done.wait(timeout=timeout)
+    if not done.is_set():
+        _raw_debug(f"_exec_script timeout after {timeout}s")
+
+    try:
+        sock.close()
+    except Exception:
+        pass
+
+    raw = buf.decode("utf-8", errors="replace")
+    if START_MARKER in raw:
+        raw = raw.split(START_MARKER, 1)[1].lstrip("\r\n")
+    if EXIT_MARKER in raw:
+        raw = raw[:raw.index(EXIT_MARKER)]
+    clean = re.sub(r"\x1b\[[0-9;]*[A-Za-z]|\r", "", raw)
+
+    return clean, exit_code[0] if exit_code[0] is not None else -1
+
+
 def cmd_exec(args):
     """通过 CloudShell WebSocket 执行任意远程命令，重定向 stdout/stderr 到本地。"""
     sess = _sess_or_exit()
@@ -2196,7 +2472,6 @@ def cmd_exec(args):
     elif getattr(args, "use_stdin", False):
         script = sys.stdin.read()
     elif getattr(args, "inline_cmd", None):
-        # macli exec JOB_ID -- cmd arg1 arg2  （argparse 会把 -- 也收进来）
         parts = args.inline_cmd
         if parts and parts[0] == "--":
             parts = parts[1:]
@@ -2217,117 +2492,18 @@ def cmd_exec(args):
     task_name = _pick_log_task(tasks, preferred=getattr(args, "task", None))
 
     dprint(f"[cyan]正在连接（task={task_name}）...[/cyan]")
-    sock = _open_exec_ws(sess, args.job_id, task_name, command="/bin/bash")
-    dprint("[green]✓ 已连接[/green]")
-
-    # ── 构造远端指令序列 ───────────────────────────────────────
-    # 用 base64 编码脚本，避免特殊字符/多行/heredoc 解析问题
-    import base64 as _b64
-    script_b64 = _b64.b64encode(script.encode()).decode()
-
-    START_MARKER = "MACLI_EXEC_START_7f3a9"
-    EXIT_MARKER  = "MACLI_EXEC_EXIT_7f3a9"
-    TMP_B64      = "/tmp/.macli_exec_b64_$$"
-
-    # 每次发一行，避免触发 PTY 行缓冲限制（≈4096 B）
-    CHUNK = 512
-    chunks = [script_b64[i:i+CHUNK] for i in range(0, len(script_b64), CHUNK)]
-
-    setup_lines = [
-        f"stty -echo; PS1=''; PS2=''\r",
-        f"TMP={TMP_B64}; rm -f \"$TMP\"\r",
-    ]
-    for ch in chunks:
-        setup_lines.append(f"printf '%s' '{ch}' >> \"$TMP\"\r")
-
-    run_parts = ["base64 -d \"$TMP\" | bash"]
-    if getattr(args, "cwd", None):
-        cwd_esc = args.cwd.replace("'", "'\\''")
-        run_parts = [f"cd '{cwd_esc}' &&"] + run_parts
-
-    exec_line = (
-        f"echo {START_MARKER}; "
-        + " ".join(run_parts)
-        + f"; echo {EXIT_MARKER}:$?; rm -f \"$TMP\"; exit\r"
+    output, code = _exec_script(
+        sess, args.job_id, task_name, script,
+        timeout=getattr(args, "timeout", 300),
+        cwd=getattr(args, "cwd", None),
     )
-    setup_lines.append(exec_line)
+    dprint("[green]✓ 完成[/green]")
 
-    # ── 收集输出 ───────────────────────────────────────────────
-    buf       = bytearray()
-    exit_code = [None]
-    done      = threading.Event()
-
-    def reader():
-        try:
-            while not done.is_set():
-                try:
-                    opcode, payload = _ws_read_frame(sock)
-                except (TimeoutError, socket.timeout):
-                    continue
-                if opcode == 8:
-                    break
-                if opcode in (1, 2) and payload:
-                    if opcode == 2 and payload[:1] == b"\x01":
-                        payload = payload[1:]
-                    if payload:
-                        buf.extend(payload)
-                        text = buf.decode("utf-8", errors="replace")
-                        if EXIT_MARKER in text:
-                            m = re.search(rf"{EXIT_MARKER}:(\d+)", text)
-                            if m:
-                                exit_code[0] = int(m.group(1))
-                            done.set()
-        except Exception as e:
-            _raw_debug(f"exec reader error: {type(e).__name__}: {e}")
-        done.set()
-
-    def heartbeat():
-        while not done.is_set():
-            done.wait(timeout=5)
-            if done.is_set():
-                break
-            try:
-                _ws_send_frame(sock, b"\x00", opcode=2)
-            except Exception:
-                break
-
-    threading.Thread(target=reader,    daemon=True).start()
-    threading.Thread(target=heartbeat, daemon=True).start()
-
-    # ── 发送指令 ───────────────────────────────────────────────
-    time.sleep(0.4)   # 等 bash 启动就绪
-    for line in setup_lines:
-        _ws_send_frame(sock, b"\x00" + line.encode(), opcode=2)
-        time.sleep(0.02)
-
-    timeout = getattr(args, "timeout", 300)
-    done.wait(timeout=timeout)
-    if not done.is_set():
-        cprint(f"[red]执行超时（{timeout}s）[/red]", file=sys.stderr)
-
-    try:
-        sock.close()
-    except Exception:
-        pass
-
-    # ── 后处理：截取 START~EXIT 之间的内容 ─────────────────────
-    raw_text = buf.decode("utf-8", errors="replace")
-
-    # 提取 START_MARKER 之后的部分
-    if START_MARKER in raw_text:
-        raw_text = raw_text.split(START_MARKER, 1)[1].lstrip("\r\n")
-    # 截掉 EXIT_MARKER 行及之后
-    if EXIT_MARKER in raw_text:
-        raw_text = raw_text[:raw_text.index(EXIT_MARKER)]
-
-    # 去除 ANSI 转义码和多余 \r
-    clean = re.sub(r"\x1b\[[0-9;]*[A-Za-z]|\r", "", raw_text)
-
-    sys.stdout.write(clean)
-    if clean and not clean.endswith("\n"):
+    sys.stdout.write(output)
+    if output and not output.endswith("\n"):
         sys.stdout.write("\n")
 
-    sys.exit(exit_code[0] if exit_code[0] is not None else 1)
+    sys.exit(code)
 
 
 def cmd_copy(args):
@@ -2632,6 +2808,10 @@ macli delete <JOB_ID> [-y | --yes] [-f | --force]  # -f/--force 会强制删除�
     q.add_argument("--limit", type=int, default=50, help="无 JOB_ID 时，最多检查多少个作业，默认 50")
     q.add_argument("--metrics", "-m", nargs="+", metavar="METRIC",
                    help="只显示指定指标，可多选：cpu mem gpu vram（默认全部）")
+    q.add_argument("--probe", action="store_true",
+                   help="通过 CloudShell exec 直接从容器内采集指标（不走监控 API）")
+    q.add_argument("--timeout", type=int, default=60,
+                   help="--probe 模式下的采集超时秒数，默认 60")
     q.add_argument("--json", action="store_true", help="JSON 输出")
 
     q = sub.add_parser("shell", help="打开作业 CloudShell 交互终端")
