@@ -434,13 +434,33 @@ class ConsoleSession:
     def base(self):
         return f"{CONSOLE_BASE}/modelarts/rest/trainingJob/v2/{self.project_id}"
 
+    def _checked_request(self, method: str, url: str, **kwargs):
+        """执行 HTTP 请求，遇到网络/SSL 异常时先检查登录状态：
+        - session 已过期 → 抛 SessionExpiredError（exit 2，触发自动重登录）
+        - 纯网络问题    → 抛原始异常
+        """
+        try:
+            return getattr(self.http, method)(url, **kwargs)
+        except requests.exceptions.SSLError as e:
+            if not self.check_login():
+                raise SessionExpiredError("session expired, please login again") from e
+            raise
+        except requests.exceptions.ConnectionError as e:
+            if not self.check_login():
+                raise SessionExpiredError("session expired, please login again") from e
+            raise
+
     def get(self, path, **params):
-        return self.http.get(f"{self.base}{path}",
-                             params=params or None, timeout=20)
+        return self._checked_request(
+            "get", f"{self.base}{path}",
+            params=params or None, timeout=20,
+        )
 
     def post(self, path, body):
-        return self.http.post(f"{self.base}{path}",
-                              json=body, timeout=30)
+        return self._checked_request(
+            "post", f"{self.base}{path}",
+            json=body, timeout=30,
+        )
 
 # ── API ──────────────────────────────────────────────────────
 
