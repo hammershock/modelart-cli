@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "modelarts-macli"
+version = "0.1.0"
+description = "华为云 ModelArts 远程管理 CLI"
+requires-python = ">=3.8"
+dependencies = [
+    "requests",
+    "rich",
+    "keyring", 
+]
+
+[project.scripts]
+macli = "macli.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
