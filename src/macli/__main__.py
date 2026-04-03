@@ -1871,7 +1871,12 @@ def _usage_panel_text(result: dict, filter_set: set = None) -> str:
             bar = _sparkline(util.get("values", []), width=36)
         color = 'green' if (latest_util or 0) < 0.5 else 'yellow' if (latest_util or 0) < 0.8 else 'red'
         lines.append(f"[bold]{title:<4}[/bold] [{color}]{bar}[/{color}] {percent}")
-        lines.append(f"      latest={latest_used}   avg={avg_used}")
+        if is_probe:
+            # 单点采样，latest==avg，只显示一行值
+            if used.get("latest") is not None:
+                lines.append(f"      {latest_used}")
+        else:
+            lines.append(f"      latest={latest_used}   avg={avg_used}")
 
     # ── 每卡 GPU/VRAM 行（probe 模式）────────────────────────────
     for dev in gpu_devs:
@@ -1977,14 +1982,11 @@ class _ProbeSpec:
 
 # ── 各平台/指标的探针定义 ────────────────────────────────────────────────────
 
-def _probe_parse_cpu(kv: dict) -> dict:
+def _probe_parse_system(kv: dict) -> dict:
+    """解析 top -bn2 输出的 CPU + 内存数据。"""
     return {
-        "cpu_util":      _probe_metric(kv.get("cpu_util")),
-        "cpu_used_core": _probe_metric(None),
-    }
-
-def _probe_parse_mem(kv: dict) -> dict:
-    return {
+        "cpu_util":              _probe_metric(kv.get("cpu_util")),
+        "cpu_used_core":         _probe_metric(None),
         "memory_util":           _probe_metric(kv.get("mem_util")),
         "memory_used_megabytes": _probe_metric(kv.get("mem_used_mb")),
     }
@@ -2015,31 +2017,31 @@ def _probe_parse_gpu(kv: dict) -> dict:
 
 _PROBE_REGISTRY: "list[_ProbeSpec]" = [
     _ProbeSpec(
-        key="cpu",
-        filter_keys={"cpu"},
-        # 避免使用 < <(...) 进程替换（部分容器 bash 不支持 /dev/fd），
-        # 改用命令替换 $() + awk -v 传参，更具可移植性
+        key="system",
+        filter_keys={"cpu", "mem"},
+        # top -bn2 -d0.5：两次采样间隔 0.5s，CPU 利用率取两次平均（更准确）。
+        # top 在容器内读取 cgroup 限制范围的内存，比 /proc/meminfo（host 全局）更准确。
+        # 解析最后一次出现的 %Cpu 和 Mem 行（第 2 次采样）。
         shell=r"""
-_t1=$(awk '/^cpu /{printf "%d %d",$2+$3+$4+$5+$6+$7+$8,$5+$6;exit}' /proc/stat)
-sleep 0.5
-_t2=$(awk '/^cpu /{printf "%d %d",$2+$3+$4+$5+$6+$7+$8,$5+$6;exit}' /proc/stat)
-awk -v t1="$_t1" -v t2="$_t2" 'BEGIN{
-    split(t1,a," "); split(t2,b," ")
-    ds=b[1]-a[1]; di=b[2]-a[2]
-    printf "cpu_util=%.6f\n", (ds>0)?(ds-di)/ds:0
+top -bn2 -d0.5 2>/dev/null | awk '
+/^(%Cpu|Cpu)/ { cpu_line = $0 }
+/Mem /         { mem_line = $0 }
+END {
+    if (cpu_line != "") {
+        match(cpu_line, /([0-9.]+)[[:space:]]*id/, a)
+        printf "cpu_util=%.6f\n", (100 - (a[1]+0)) / 100
+    }
+    if (mem_line != "") {
+        scale = (mem_line ~ /KiB/) ? 1/1024 : 1
+        match(mem_line, /([0-9.]+)[[:space:]]*total/, ta)
+        match(mem_line, /([0-9.]+)[[:space:]]*used/,  ua)
+        total = ta[1] * scale
+        used  = ua[1] * scale
+        printf "mem_used_mb=%.2f\nmem_util=%.6f\n", used, (total > 0) ? used/total : 0
+    }
 }'
 """,
-        parse_fn=_probe_parse_cpu,
-    ),
-    _ProbeSpec(
-        key="mem",
-        filter_keys={"mem"},
-        shell=r"""
-awk '/MemTotal:/{t=$2}/MemAvailable:/{a=$2} \
-    END{u=t-a; printf "mem_used_mb=%.2f\nmem_util=%.6f\n", u/1024, (t>0)?u/t:0}' \
-    /proc/meminfo
-""",
-        parse_fn=_probe_parse_mem,
+        parse_fn=_probe_parse_system,
     ),
     _ProbeSpec(
         key="gpu",
