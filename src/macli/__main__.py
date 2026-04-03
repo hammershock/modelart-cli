@@ -1500,6 +1500,20 @@ def cmd_list_jobs(args):
     else:
         cprint("[dim]用 detail <JOB_ID> 查看 SSH 信息[/dim]")
 def cmd_detail(args):
+    # 无参数：等同于 jobs --detail
+    if not getattr(args, "job_id", None) and not getattr(args, "src_name", None):
+        import types
+        list_args = types.SimpleNamespace(
+            action=None, limit=50,
+            recent=None, running=False, failed=False,
+            terminated=False, pending=False, status=None,
+            gpu_count=None, name=None,
+            detail=True, refresh=getattr(args, "refresh", False),
+            json=getattr(args, "json", False),
+        )
+        cmd_list_jobs(list_args)
+        return
+
     sess = _sess_or_exit()
     api  = API(sess)
 
@@ -2414,12 +2428,14 @@ macli delete <JOB_ID> [-y | --yes] [-f | --force]  # -f/--force 会强制删除�
                    help="与 --detail 配合使用：清空所有缓存，强制重新拉取所有符合条件的 detail 并重建缓存")
     q.add_argument("--json",       action="store_true", help="JSON 输出")
 
-    q = sub.add_parser("detail", help="作业详情 + SSH 信息")
-    grp = q.add_mutually_exclusive_group(required=True)
+    q = sub.add_parser("detail", help="作业详情 + SSH 信息；无参数时等同于 jobs --detail")
+    grp = q.add_mutually_exclusive_group(required=False)
     grp.add_argument("job_id",     metavar="JOB_ID",  nargs="?", default=None,
-                     help="作业 ID")
+                     help="作业 ID；省略则列出所有作业（含 detail）")
     grp.add_argument("--name",     dest="src_name",   default=None,
                      help="按作业名称查找（取最新一个）")
+    q.add_argument("--refresh",    action="store_true",
+                   help="清空 detail 缓存并强制重新拉取（仅无参数模式有效）")
     q.add_argument("--json", action="store_true", help="JSON 输出")
 
     q = sub.add_parser("events", help="作业事件详情")
