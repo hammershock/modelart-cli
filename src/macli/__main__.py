@@ -1920,12 +1920,22 @@ def _fetch_usage_result(api: API, job_id: str, minutes: int, step: int) -> dict:
         "step": step,
         "metrics": {},
     }
+    # 监控 API 的 util 类指标以百分比（0-100）返回，统一除以 100 归一化为 0-1
+    # 以便与 probe 模式、_usage_panel_text 里的 ×100 显示逻辑保持一致
+    _API_PERCENT_KEYS = {"cpu_util", "memory_util", "gpu_util", "gpu_mem_util"}
+
     for key, metric_name in metrics.items():
         query = _build_usage_query(metric_name, job_id)
         data = api.query_usage_range(query=query, start=start_ts, end=end_ts, step=step)
         series = (((data or {}).get("data") or {}).get("result") or [])
         values = (series[0].get("values") if series else []) or []
-        result["metrics"][key] = _usage_series_stats(values)
+        stats = _usage_series_stats(values)
+        if key in _API_PERCENT_KEYS:
+            for field in ("latest", "avg", "max"):
+                if stats[field] is not None:
+                    stats[field] = stats[field] / 100
+            stats["values"] = [[ts, v / 100] for ts, v in stats["values"]]
+        result["metrics"][key] = stats
     return result
 
 
@@ -2007,11 +2017,17 @@ _PROBE_REGISTRY: "list[_ProbeSpec]" = [
     _ProbeSpec(
         key="cpu",
         filter_keys={"cpu"},
+        # 避免使用 < <(...) 进程替换（部分容器 bash 不支持 /dev/fd），
+        # 改用命令替换 $() + awk -v 传参，更具可移植性
         shell=r"""
-cpu_s(){ awk '/^cpu /{printf "%d %d\n",$2+$3+$4+$5+$6+$7+$8,$5+$6}' /proc/stat; }
-read s1 i1 < <(cpu_s); sleep 0.3; read s2 i2 < <(cpu_s)
-ds=$((s2-s1)); di=$((i2-i1))
-awk "BEGIN{u=($ds>0)?($ds-$di)/$ds:0; printf \"cpu_util=%.6f\n\",u}"
+_t1=$(awk '/^cpu /{printf "%d %d",$2+$3+$4+$5+$6+$7+$8,$5+$6;exit}' /proc/stat)
+sleep 0.5
+_t2=$(awk '/^cpu /{printf "%d %d",$2+$3+$4+$5+$6+$7+$8,$5+$6;exit}' /proc/stat)
+awk -v t1="$_t1" -v t2="$_t2" 'BEGIN{
+    split(t1,a," "); split(t2,b," ")
+    ds=b[1]-a[1]; di=b[2]-a[2]
+    printf "cpu_util=%.6f\n", (ds>0)?(ds-di)/ds:0
+}'
 """,
         parse_fn=_probe_parse_cpu,
     ),
@@ -2131,7 +2147,10 @@ def cmd_usage(args):
             title=f"作业监控  {args.job_id}",
             border_style="cyan",
         ))
-        cprint(f"[dim]时间范围: 最近 {args.minutes} 分钟，step={args.step}s[/dim]")
+        if use_probe:
+            cprint("[dim][probe] 实时单点采样[/dim]")
+        else:
+            cprint(f"[dim]时间范围: 最近 {args.minutes} 分钟，step={args.step}s[/dim]")
         return
 
     jobs = api.list_jobs(limit=args.limit).get("items", [])
@@ -2197,7 +2216,10 @@ def cmd_usage(args):
     for row in rows:
         t.add_row(row["name"], row["job_id"], *[fmt(row) for _, fmt in active_cols])
     console.print(t)
-    cprint(f"[dim]仅显示 Running 作业最近 usage；时间范围: 最近 {args.minutes} 分钟，step={args.step}s[/dim]")
+    if use_probe:
+        cprint("[dim]仅显示 Running 作业最近 usage；[probe] 实时单点采样[/dim]")
+    else:
+        cprint(f"[dim]仅显示 Running 作业最近 usage；时间范围: 最近 {args.minutes} 分钟，step={args.step}s[/dim]")
 
 
 
