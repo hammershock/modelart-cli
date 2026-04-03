@@ -1808,15 +1808,34 @@ def _sparkline(values: list, width: int = 32) -> str:
     return "".join(chars)
 
 
-def _usage_panel_text(result: dict) -> str:
+_USAGE_METRIC_ALIASES = {
+    "cpu":  "cpu",
+    "mem":  "mem",  "memory": "mem",
+    "gpu":  "gpu",
+    "vram": "vram", "gpu_mem": "vram", "gmem": "vram",
+}
+
+def _parse_metrics_filter(raw: list) -> set:
+    """将用户传入的 metric 名列表规范化为内部 key 集合（cpu/mem/gpu/vram）。"""
+    result = set()
+    for item in raw or []:
+        key = _USAGE_METRIC_ALIASES.get(item.lower())
+        if key:
+            result.add(key)
+    return result or {"cpu", "mem", "gpu", "vram"}   # 空 = 全部
+
+
+def _usage_panel_text(result: dict, filter_set: set = None) -> str:
     m = result["metrics"]
     lines = []
-    rows = [
-        ("CPU", "cpu_util", "cpu_used_core"),
-        ("内存", "memory_util", "memory_used_megabytes"),
-        ("GPU", "gpu_util", "gpu_mem_used_megabytes"),
-        ("显存", "gpu_mem_util", "gpu_mem_used_megabytes"),
+    all_rows = [
+        ("CPU", "cpu",  "cpu_util", "cpu_used_core"),
+        ("内存", "mem", "memory_util", "memory_used_megabytes"),
+        ("GPU", "gpu",  "gpu_util", "gpu_mem_used_megabytes"),
+        ("显存", "vram","gpu_mem_util", "gpu_mem_used_megabytes"),
     ]
+    rows = [(t, uk, sk) for t, k, uk, sk in all_rows
+            if filter_set is None or k in filter_set]
     start_ts = None
     end_ts = None
     for title, util_key, used_key in rows:
@@ -1874,13 +1893,15 @@ def cmd_usage(args):
     sess = _sess_or_exit()
     api  = API(sess)
 
+    filter_set = _parse_metrics_filter(getattr(args, "metrics", None) or [])
+
     if args.job_id:
         result = _fetch_usage_result(api, args.job_id, args.minutes, args.step)
         if getattr(args, "json", False):
             _json_out(result)
             return
         console.print(Panel(
-            _usage_panel_text(result),
+            _usage_panel_text(result, filter_set=filter_set),
             title=f"作业监控  {args.job_id}",
             border_style="cyan",
         ))
@@ -1912,22 +1933,22 @@ def cmd_usage(args):
         })
         return
 
+    # 多作业表格：按 filter_set 决定显示哪些列
+    col_defs = [
+        ("cpu",  "CPU",  "cpu_util",              lambda r: _fmt_usage_value("cpu_util", r["cpu"])),
+        ("mem",  "内存", "memory_used_megabytes",  lambda r: _fmt_usage_value("memory_used_megabytes", r["mem"])),
+        ("gpu",  "GPU",  "gpu_util",               lambda r: _fmt_usage_value("gpu_util", r["gpu"])),
+        ("vram", "显存", "gpu_mem_used_megabytes",  lambda r: _fmt_usage_value("gpu_mem_used_megabytes", r["gpu_mem"])),
+    ]
+    active_cols = [(label, fmt) for key, label, _, fmt in col_defs if key in filter_set]
+
     t = Table(title="Running 作业最近 usage", header_style="bold cyan")
     t.add_column("名称", style="green")
     t.add_column("JOB_ID", style="dim")
-    t.add_column("CPU")
-    t.add_column("内存")
-    t.add_column("GPU")
-    t.add_column("显存")
+    for label, _ in active_cols:
+        t.add_column(label)
     for row in rows:
-        t.add_row(
-            row["name"],
-            row["job_id"],
-            _fmt_usage_value("cpu_util", row["cpu"]),
-            _fmt_usage_value("memory_used_megabytes", row["mem"]),
-            _fmt_usage_value("gpu_util", row["gpu"]),
-            _fmt_usage_value("gpu_mem_used_megabytes", row["gpu_mem"]),
-        )
+        t.add_row(row["name"], row["job_id"], *[fmt(row) for _, fmt in active_cols])
     console.print(t)
     cprint(f"[dim]仅显示 Running 作业最近 usage；时间范围: 最近 {args.minutes} 分钟，step={args.step}s[/dim]")
 
@@ -2609,6 +2630,8 @@ macli delete <JOB_ID> [-y | --yes] [-f | --force]  # -f/--force 会强制删除�
     q.add_argument("--minutes", type=int, default=15, help="最近多少分钟，默认 15")
     q.add_argument("--step", type=int, default=60, help="采样步长（秒），默认 60")
     q.add_argument("--limit", type=int, default=50, help="无 JOB_ID 时，最多检查多少个作业，默认 50")
+    q.add_argument("--metrics", "-m", nargs="+", metavar="METRIC",
+                   help="只显示指定指标，可多选：cpu mem gpu vram（默认全部）")
     q.add_argument("--json", action="store_true", help="JSON 输出")
 
     q = sub.add_parser("shell", help="打开作业 CloudShell 交互终端")
