@@ -1825,19 +1825,35 @@ def _parse_metrics_filter(raw: list) -> set:
     return result or {"cpu", "mem", "gpu", "vram"}   # 空 = 全部
 
 
+def _util_bar(util: float, width: int = 36) -> str:
+    """探针模式用：单采样点实心进度条（无时序数据，不用 sparkline）。"""
+    filled = round(max(0.0, min(1.0, util)) * width)
+    return "█" * filled + "░" * (width - filled)
+
+
 def _usage_panel_text(result: dict, filter_set: set = None) -> str:
-    m = result["metrics"]
+    m        = result["metrics"]
+    is_probe = result.get("probe", False)
+    # 每卡详情（probe 模式专有）
+    gpu_devs  = m.get("gpu_devices", []) if is_probe else []
+    want_gpu  = filter_set is None or "gpu"  in filter_set
+    want_vram = filter_set is None or "vram" in filter_set
+    use_per_gpu = bool(gpu_devs) and (want_gpu or want_vram)
+
     lines = []
     all_rows = [
-        ("CPU", "cpu",  "cpu_util", "cpu_used_core"),
-        ("内存", "mem", "memory_util", "memory_used_megabytes"),
-        ("GPU", "gpu",  "gpu_util", "gpu_mem_used_megabytes"),
-        ("显存", "vram","gpu_mem_util", "gpu_mem_used_megabytes"),
+        ("CPU",  "cpu",  "cpu_util",     "cpu_used_core"),
+        ("内存", "mem",  "memory_util",  "memory_used_megabytes"),
+        ("GPU",  "gpu",  "gpu_util",     "gpu_mem_used_megabytes"),
+        ("显存", "vram", "gpu_mem_util", "gpu_mem_used_megabytes"),
     ]
+    # 有每卡数据时跳过通用 GPU/VRAM 行，改用下方的 per-GPU 渲染
     rows = [(t, uk, sk) for t, k, uk, sk in all_rows
-            if filter_set is None or k in filter_set]
+            if (filter_set is None or k in filter_set)
+            and not (use_per_gpu and k in {"gpu", "vram"})]
+
     start_ts = None
-    end_ts = None
+    end_ts   = None
     for title, util_key, used_key in rows:
         util = m.get(util_key, {})
         used = m.get(used_key, {})
@@ -1848,11 +1864,35 @@ def _usage_panel_text(result: dict, filter_set: set = None) -> str:
         latest_util = util.get("latest")
         percent = f"{latest_util * 100:.1f}%" if latest_util is not None else "--"
         latest_used = _fmt_usage_value(used_key, used.get("latest"))
-        avg_used = _fmt_usage_value(used_key, used.get("avg"))
-        trend = _sparkline(util.get("values", []), width=36)
+        avg_used    = _fmt_usage_value(used_key, used.get("avg"))
+        if is_probe:
+            bar = _util_bar(latest_util or 0)
+        else:
+            bar = _sparkline(util.get("values", []), width=36)
         color = 'green' if (latest_util or 0) < 0.5 else 'yellow' if (latest_util or 0) < 0.8 else 'red'
-        lines.append(f"[bold]{title:<4}[/bold] [{color}]{trend}[/{color}] {percent}")
+        lines.append(f"[bold]{title:<4}[/bold] [{color}]{bar}[/{color}] {percent}")
         lines.append(f"      latest={latest_used}   avg={avg_used}")
+
+    # ── 每卡 GPU/VRAM 行（probe 模式）────────────────────────────
+    for dev in gpu_devs:
+        idx        = dev["index"]
+        util       = dev.get("util",         0.0)
+        vram_used  = dev.get("vram_used_mb",  0.0)
+        vram_total = dev.get("vram_total_mb", 0.0)
+        vram_util  = dev.get("vram_util",     0.0)
+
+        color = 'green' if util < 0.5 else 'yellow' if util < 0.8 else 'red'
+
+        if want_gpu:
+            bar = _util_bar(util)
+            lines.append(f"[bold]GPU{idx} [/bold][{color}]{bar}[/{color}] {util*100:.1f}%")
+        if want_vram:
+            vram_bar   = _util_bar(vram_util)
+            vram_str   = f"{vram_used:.0f}/{vram_total:.0f} MB"
+            vram_color = 'green' if vram_util < 0.5 else 'yellow' if vram_util < 0.8 else 'red'
+            prefix = "     " if want_gpu else f"[bold]GPU{idx} [/bold]"
+            lines.append(f"{prefix}[{vram_color}]{vram_bar}[/{vram_color}] VRAM {vram_str}  {vram_util*100:.1f}%")
+
     if start_ts and end_ts:
         from datetime import datetime as _dt
         st = _dt.fromtimestamp(start_ts).strftime('%H:%M')
@@ -1940,10 +1980,26 @@ def _probe_parse_mem(kv: dict) -> dict:
     }
 
 def _probe_parse_gpu(kv: dict) -> dict:
+    gpu_count = int(kv.get("gpu_count", 0))
+    devices = []
+    for i in range(gpu_count):
+        util       = kv.get(f"gpu_{i}_util")
+        vram_used  = kv.get(f"gpu_{i}_vram_used_mb")
+        vram_total = kv.get(f"gpu_{i}_vram_total_mb")
+        if util is not None:
+            vram_util = (vram_used / vram_total) if (vram_total and vram_total > 0) else 0.0
+            devices.append({
+                "index":        i,
+                "util":         util,
+                "vram_used_mb": vram_used  or 0.0,
+                "vram_total_mb":vram_total or 0.0,
+                "vram_util":    vram_util,
+            })
     return {
-        "gpu_util":               _probe_metric(kv.get("gpu_util")),
-        "gpu_mem_util":           _probe_metric(kv.get("vram_util")),
-        "gpu_mem_used_megabytes": _probe_metric(kv.get("vram_used_mb")),
+        "gpu_util":               _probe_metric(kv.get("gpu_avg_util")),
+        "gpu_mem_util":           _probe_metric(kv.get("vram_avg_util")),
+        "gpu_mem_used_megabytes": _probe_metric(kv.get("vram_avg_used_mb")),
+        "gpu_devices":            devices,   # list[dict], probe-only per-GPU detail
     }
 
 
@@ -1972,18 +2028,24 @@ awk '/MemTotal:/{t=$2}/MemAvailable:/{a=$2} \
     _ProbeSpec(
         key="gpu",
         filter_keys={"gpu", "vram"},
-        # nvidia-smi 不可用时输出全零，平均多卡利用率/显存
+        # 每卡输出 gpu_N_util / gpu_N_vram_used_mb / gpu_N_vram_total_mb
+        # 同时输出聚合均值供回退使用；nvidia-smi 不可用时全零
         shell=r"""
 if command -v nvidia-smi &>/dev/null; then
-    nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total \
+    nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total \
         --format=csv,noheader,nounits 2>/dev/null | \
-    awk -F'[, ]+' '
-        {gu+=$1; vm+=$2; vt+=$3; n++}
-        END{if(n>0) printf "gpu_util=%.6f\nvram_used_mb=%.2f\nvram_util=%.6f\n",
-                           gu/100/n, vm/n, (vt>0)?vm/vt:0;
-            else      print "gpu_util=0\nvram_used_mb=0\nvram_util=0"}'
+    awk -F'[, ]+' '{
+        i=$1; gu=$2; vm=$3; vt=$4
+        printf "gpu_%d_util=%.6f\ngpu_%d_vram_used_mb=%.2f\ngpu_%d_vram_total_mb=%.2f\n",
+               i,gu/100, i,vm, i,vt
+        tgu+=gu; tvm+=vm; tvt+=vt; n++
+    } END{
+        if(n>0) printf "gpu_count=%d\ngpu_avg_util=%.6f\nvram_avg_used_mb=%.2f\nvram_avg_util=%.6f\n",
+                        n, tgu/100/n, tvm/n, (tvt>0)?tvm/tvt:0
+        else    print "gpu_count=0\ngpu_avg_util=0\nvram_avg_used_mb=0\nvram_avg_util=0"
+    }'
 else
-    printf "gpu_util=0\nvram_used_mb=0\nvram_util=0\n"
+    printf "gpu_count=0\ngpu_avg_util=0\nvram_avg_used_mb=0\nvram_avg_util=0\n"
 fi
 """,
         parse_fn=_probe_parse_gpu,
@@ -2086,12 +2148,13 @@ def cmd_usage(args):
         else:
             u = _fetch_usage_result(api, job_id, args.minutes, args.step)
         rows.append({
-            "job_id": job_id,
-            "name": name,
-            "cpu": u["metrics"].get("cpu_util", {}).get("latest"),
-            "mem": u["metrics"].get("memory_used_megabytes", {}).get("latest"),
-            "gpu": u["metrics"].get("gpu_util", {}).get("latest"),
-            "gpu_mem": u["metrics"].get("gpu_mem_used_megabytes", {}).get("latest"),
+            "job_id":      job_id,
+            "name":        name,
+            "cpu":         u["metrics"].get("cpu_util",              {}).get("latest"),
+            "mem":         u["metrics"].get("memory_used_megabytes", {}).get("latest"),
+            "gpu":         u["metrics"].get("gpu_util",              {}).get("latest"),
+            "gpu_mem":     u["metrics"].get("gpu_mem_used_megabytes",{}).get("latest"),
+            "gpu_devices": u["metrics"].get("gpu_devices", []),
         })
 
     if getattr(args, "json", False):
@@ -2102,14 +2165,29 @@ def cmd_usage(args):
         })
         return
 
+    def _fmt_gpu_cell(r):
+        devs = r.get("gpu_devices", [])
+        if devs:
+            return " / ".join(f"GPU{d['index']} {d['util']*100:.0f}%" for d in devs)
+        return _fmt_usage_value("gpu_util", r["gpu"])
+
+    def _fmt_vram_cell(r):
+        devs = r.get("gpu_devices", [])
+        if devs:
+            return " / ".join(
+                f"GPU{d['index']} {d['vram_used_mb']:.0f}/{d['vram_total_mb']:.0f}MB"
+                for d in devs
+            )
+        return _fmt_usage_value("gpu_mem_used_megabytes", r["gpu_mem"])
+
     # 多作业表格：按 filter_set 决定显示哪些列
     col_defs = [
-        ("cpu",  "CPU",  "cpu_util",              lambda r: _fmt_usage_value("cpu_util", r["cpu"])),
-        ("mem",  "内存", "memory_used_megabytes",  lambda r: _fmt_usage_value("memory_used_megabytes", r["mem"])),
-        ("gpu",  "GPU",  "gpu_util",               lambda r: _fmt_usage_value("gpu_util", r["gpu"])),
-        ("vram", "显存", "gpu_mem_used_megabytes",  lambda r: _fmt_usage_value("gpu_mem_used_megabytes", r["gpu_mem"])),
+        ("cpu",  "CPU",  lambda r: _fmt_usage_value("cpu_util", r["cpu"])),
+        ("mem",  "内存", lambda r: _fmt_usage_value("memory_used_megabytes", r["mem"])),
+        ("gpu",  "GPU",  _fmt_gpu_cell),
+        ("vram", "显存", _fmt_vram_cell),
     ]
-    active_cols = [(label, fmt) for key, label, _, fmt in col_defs if key in filter_set]
+    active_cols = [(label, fmt) for key, label, fmt in col_defs if key in filter_set]
 
     t = Table(title="Running 作业最近 usage", header_style="bold cyan")
     t.add_column("名称", style="green")
