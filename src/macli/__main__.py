@@ -159,6 +159,61 @@ def save_session(data: dict):
     p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+# ── SSH 密钥管理 ──────────────────────────────────────────────
+
+def load_identityfiles() -> tuple:
+    """返回 (files_dict, default_name)，files_dict 为 {name: path}。"""
+    data = load_session()
+    return data.get("identityfiles", {}), data.get("default_identityfile", None)
+
+
+def save_identityfiles(files: dict, default: str = None):
+    """将 identityfiles 写回 session.json。"""
+    data = load_session()
+    data["identityfiles"] = files
+    data["default_identityfile"] = default
+    save_session(data)
+
+
+def get_exec_backend() -> str:
+    """返回已保存的 exec 后端，默认 cloudshell。"""
+    return load_session().get("exec_backend", "cloudshell")
+
+
+def set_exec_backend(backend: str):
+    """持久化 exec 后端选择。"""
+    data = load_session()
+    data["exec_backend"] = backend
+    save_session(data)
+
+
+def resolve_identityfile(name_or_path: str) -> str:
+    """将名称或路径解析为实际文件路径。
+    - 若含路径分隔符或以 . 开头，视为路径直接使用
+    - 否则在已保存的密钥列表中按名称查找
+    - 找不到则原样返回（交由 SSH 自行报错）
+    """
+    if not name_or_path:
+        return name_or_path
+    if os.sep in name_or_path or name_or_path.startswith(".") or name_or_path.startswith("~"):
+        return str(Path(name_or_path).expanduser())
+    files, _ = load_identityfiles()
+    if name_or_path in files:
+        return str(Path(files[name_or_path]).expanduser())
+    # 可能就是文件名（相对路径），直接返回
+    return name_or_path
+
+
+def _parse_ssh_url(url: str):
+    """从 ssh://user@host:port 中提取 (user, host, port)，失败返回 (None, None, None)。"""
+    if not url:
+        return None, None, None
+    m = re.match(r"^ssh://([^@]+)@([^:]+):(\d+)$", url.strip())
+    if m:
+        return m.group(1), m.group(2), int(m.group(3))
+    return None, None, None
+
+
 # ── 凭据安全存储（系统 Keychain）────────────────────────────────
 
 def _load_saved_creds() -> dict:
@@ -200,19 +255,207 @@ def _clear_saved_creds() -> bool:
         return False
 
 
-def load_detail_cache() -> dict:
-    """从 session 的 detail_cache 字段读取 job detail 缓存。
-    返回 {job_id: job_detail_dict, ...}。
+# ── 自动登录 ──────────────────────────────────────────────────
+
+_AUTOLOGIN_KEY = "auto_login"
+
+
+def _load_auto_login_cfg() -> dict:
+    """从 session.json 读取自动登录配置，返回 dict（未配置时返回 {}）"""
+    return load_session().get(_AUTOLOGIN_KEY, {})
+
+
+def _save_auto_login_cfg(cfg: dict):
+    """将自动登录配置写回 session.json"""
+    data = load_session()
+    data[_AUTOLOGIN_KEY] = cfg
+    save_session(data)
+
+
+def _ntfy_poll_otp(topic: str, since_ts: int, timeout: int = 120) -> str:
     """
-    d = load_session()
-    return d.get("detail_cache", {})
+    轮询 ntfy.sh/{topic}，返回第一条在 since_ts 之后发布的 6 位纯数字消息体。
+    超时或失败时返回空字符串。
+    """
+    deadline = time.monotonic() + timeout
+    url = f"https://ntfy.sh/{topic}/json"
+    seen_ids: set = set()
+    dprint(f"[dim]ntfy 轮询开始  url={url}  since={since_ts}[/dim]")
+    while time.monotonic() < deadline:
+        try:
+            r = requests.get(url, params={"poll": "1", "since": str(since_ts)}, timeout=10)
+            dprint(f"[dim]ntfy 响应 HTTP {r.status_code}  body={r.text[:120]!r}[/dim]")
+            if r.status_code == 200:
+                for line in r.text.strip().splitlines():
+                    if not line.strip():
+                        continue
+                    try:
+                        msg = json.loads(line)
+                    except Exception:
+                        continue
+                    mid  = msg.get("id", "")
+                    body = (msg.get("message") or "").strip()
+                    if mid in seen_ids:
+                        continue
+                    seen_ids.add(mid)
+                    # 快捷指令有时将 {"message":"123456"} 作为纯文本发送，需要解包
+                    if body.startswith("{"):
+                        try:
+                            inner = json.loads(body)
+                            body = (inner.get("message") or body).strip()
+                        except Exception:
+                            pass
+                    dprint(f"[dim]ntfy 消息 id={mid!r} body={body!r}[/dim]")
+                    # 支持完整短信原文，从中提取首个 6 位数字
+                    m = re.search(r"\b(\d{6})\b", body)
+                    if m:
+                        return m.group(1)
+        except Exception as ex:
+            dprint(f"[dim]ntfy 轮询异常: {ex}[/dim]")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(3.0, remaining))
+    return ""
 
 
-def save_detail_cache(cache: dict):
-    """将 detail cache 写回 session 的 detail_cache 字段。"""
-    d = load_session()
-    d["detail_cache"] = cache
-    save_session(d)
+def _do_auto_login(cfg: dict) -> bool:
+    """
+    用 keyring 中存储的账号密码 + ntfy OTP 通道自动完成登录，
+    成功后更新 session.json 并返回 True，失败返回 False。
+    """
+    creds = _load_saved_creds()
+    if not (creds.get("domain") and creds.get("username") and creds.get("password")):
+        cprint("[red]自动登录失败：keyring 中无账号密码，请先执行 macli autologin enable[/red]")
+        return False
+
+    ntfy_topic  = cfg.get("ntfy_topic", "")
+    max_retries = int(cfg.get("max_retries", 3))
+    otp_timeout = int(cfg.get("otp_wait_secs", 120))
+
+    if not ntfy_topic:
+        cprint("[red]自动登录失败：未配置 ntfy_topic，请执行 macli autologin enable[/red]")
+        return False
+
+    cprint(
+        f"\n[bold cyan]⟳ 会话已过期，自动重新登录[/bold cyan]"
+        f"  [dim]{creds['username']} @ {creds['domain']}[/dim]"
+    )
+
+    for attempt in range(1, max_retries + 1):
+        if attempt > 1:
+            cprint(f"[yellow]第 {attempt}/{max_retries} 次重试...[/yellow]")
+
+        # 捕获 poll_since 在闭包外，每次尝试都重新记录
+        poll_since = int(time.time())
+
+        def _otp_provider(since=poll_since) -> str:
+            dprint(f"[dim]ntfy 开始轮询，since={since}，topic={ntfy_topic}，timeout={otp_timeout}s[/dim]")
+            cprint(f"[cyan]  ⟳ 等待手机验证码（最多 {otp_timeout} 秒）...[/cyan]")
+            code = _ntfy_poll_otp(ntfy_topic, since, timeout=otp_timeout)
+            if not code:
+                cprint("[yellow]  验证码等待超时[/yellow]")
+            else:
+                dprint(f"[dim]ntfy 收到验证码: {code}[/dim]")
+            return code
+
+        ck = _http_login(
+            creds["domain"], creds["username"], creds["password"],
+            otp_provider=_otp_provider,
+        )
+        if ck:
+            _setup_session_from_cookie(ck, interactive=False)
+            cprint("[bold green]✓ 自动重新登录成功[/bold green]")
+            return True
+        cprint(f"[yellow]第 {attempt} 次尝试失败[/yellow]")
+
+    cprint("[red]✗ 自动重新登录失败，已超过最大重试次数[/red]")
+    return False
+
+
+class PortCache:
+    """
+    Running 状态 job 的 SSH 端口缓存（线程安全写入）。
+
+    规则：
+    - 只有 Running 状态的 job 才可能持有 SSH 端口
+    - 端口在 job 运行期间固定不变，结束时失效
+    - job 一旦不再 Running，立即从缓存中驱逐
+    - 持久化到 session.json["ssh_port_cache"]
+    """
+    _SESSION_KEY = "ssh_port_cache"
+
+    def __init__(self):
+        self._data: dict = {}   # {job_id: [{task, url, port}, ...]}
+        self._dirty = False
+        self._lock = threading.Lock()
+
+    def load(self) -> "PortCache":
+        self._data = load_session().get(self._SESSION_KEY, {})
+        self._dirty = False
+        return self
+
+    def save(self):
+        if not self._dirty:
+            return
+        with self._lock:
+            d = load_session()
+            d[self._SESSION_KEY] = self._data
+            save_session(d)
+            self._dirty = False
+
+    def get(self, job_id: str):
+        """缓存命中返回 ssh entries 列表；未命中返回 None。"""
+        return self._data.get(job_id)
+
+    def put(self, job_id: str, entries: list):
+        """写入非空 entries（线程安全）。"""
+        if not entries:
+            return
+        with self._lock:
+            self._data[job_id] = entries
+            self._dirty = True
+
+    def evict(self, job_id: str):
+        with self._lock:
+            if job_id in self._data:
+                del self._data[job_id]
+                self._dirty = True
+
+    def evict_non_running(self, running_ids: set) -> list:
+        """清除不在 running_ids 中的所有缓存条目，返回被清除的 ID 列表。"""
+        with self._lock:
+            stale = [k for k in list(self._data) if k not in running_ids]
+            for k in stale:
+                del self._data[k]
+            if stale:
+                self._dirty = True
+        return stale
+
+
+def resolve_ssh(api: "API", job_id: str, phase: str,
+                cache: "PortCache", detail_hint: dict = None) -> list:
+    """
+    获取 job 的 SSH entries（带缓存）。
+
+    - 非 Running 状态：驱逐缓存，返回 []
+    - Running + 缓存命中：直接返回缓存
+    - Running + 缓存未命中：用 detail_hint 或拉取 detail，有端口则写缓存
+    """
+    if phase != "Running":
+        cache.evict(job_id)
+        return []
+    cached = cache.get(job_id)
+    if cached is not None:
+        return cached
+    detail = detail_hint or api.get_job(job_id)
+    if not detail:
+        return []
+    entries = enrich_ssh_entries(
+        detail.get("endpoints", {}).get("ssh", {}).get("task_urls", [])
+    )
+    cache.put(job_id, entries)
+    return entries
 
 
 def parse_recent(s: str):
@@ -357,7 +600,9 @@ class ConsoleSession:
             k, _, v = part.strip().partition("=")
             if k: self.http.cookies.set(k.strip(), v.strip())
         self._set_headers()
-        save_session({
+
+        data = load_session()
+        data.update({
             "region":       region,
             "project_id":   project_id,
             "agency_id":    agency_id,
@@ -367,6 +612,7 @@ class ConsoleSession:
             "cookie_str":   cookie_str,
             "saved_at":     time.time(),
         })
+        save_session(data)
 
     def restore(self):
         d = load_session()
@@ -764,7 +1010,8 @@ def _select_workspace(sess) -> str:
 
 
 def _http_login(domain: str, username: str, password: str,
-                service: str = "https://console.huaweicloud.com/console/") -> str:
+                service: str = "https://console.huaweicloud.com/console/",
+                otp_provider=None) -> str:
     """
     纯 HTTP 登录华为云（IAM 用户 + 短信 MFA），返回 cookie 字符串。
     失败返回空字符串。
@@ -867,7 +1114,8 @@ def _http_login(domain: str, username: str, password: str,
     else:
         cprint("[yellow]验证码将发送至您绑定的手机[/yellow]")
 
-    input("按 Enter 发送验证码...")
+    if otp_provider is None:
+        input("按 Enter 发送验证码...")
     dprint("[dim][5] 发送短信...[/dim]")
     r = s.post(
         "https://auth.huaweicloud.com/authui/sendLoginSms",
@@ -884,8 +1132,12 @@ def _http_login(domain: str, username: str, password: str,
         cprint("[green]✓ 验证码已发送[/green]")
 
     # Step 6: 输入并提交验证码
-    sys.stdout.flush()
-    sms_code = input("\n请输入收到的 6 位验证码: ").strip()
+    if otp_provider is not None:
+        dprint("[dim][6] 调用 otp_provider 获取验证码...[/dim]")
+        sms_code = otp_provider()
+    else:
+        sys.stdout.flush()
+        sms_code = input("\n请输入收到的 6 位验证码: ").strip()
     if not sms_code:
         cprint("[red]验证码不能为空[/red]")
         return ""
@@ -1262,20 +1514,32 @@ def cmd_region_select(args):
 
 
 def cmd_logout(args):
-    """清除已保存的登录凭据"""
+    """清除已保存的登录凭据（保留持久化偏好配置）"""
+    session_keys = {
+        "region", "project_id", "agency_id", "workspace_id", "cftk",
+        "cookies", "cookie_str", "saved_at", "ssh_port_cache",
+    }
+
+    data = load_session()
+    had_session_state = any(k in data for k in session_keys)
+    for k in session_keys:
+        data.pop(k, None)
+
     p = _config_path()
-    cleared_session = False
-    if p.exists():
+    if data:
+        save_session(data)
+    elif p.exists():
         p.unlink()
-        cleared_session = True
 
     cleared_creds = _clear_saved_creds()
 
-    if cleared_session or cleared_creds:
+    if had_session_state or cleared_creds:
         parts = []
-        if cleared_session: parts.append("session")
-        if cleared_creds:   parts.append("Keychain 账号密码")
+        if had_session_state: parts.append("登录 session")
+        if cleared_creds:     parts.append("Keychain 账号密码")
         cprint(f"[green]✓ 已清除：{' 及 '.join(parts)}[/green]")
+        if data:
+            cprint("[dim]已保留其他配置：如 autologin、identityfiles、exec backend 等[/dim]")
     else:
         cprint("[yellow]当前没有已保存的登录凭据[/yellow]")
 
@@ -1391,65 +1655,41 @@ def cmd_list_jobs(args):
             print(len(jobs))
         return
 
-    if getattr(args, "detail", False) and jobs:
-        do_refresh = getattr(args, "refresh", False)
+    # ── SSH 端口解析（PortCache）─────────────────────────────
+    port_cache = PortCache().load()
+    if getattr(args, "refresh", False):
+        port_cache = PortCache()
+        dprint("[dim]--refresh: 已清空端口缓存，强制重新拉取[/dim]")
 
-        # 缓存结构：{job_id: endpoints_dict}
-        # 只缓存 detail 接口独有的 endpoints 字段（SSH 等）
-        # job 的状态、时长等会变化的字段始终来自列表接口的新鲜数据，不参与缓存
-        cache = {} if do_refresh else load_detail_cache()
-        if do_refresh:
-            dprint("[dim]--refresh: 已清空 detail 缓存，强制重新拉取[/dim]")
+    running_ids = {j.get("metadata", {}).get("id", "") for j in jobs
+                   if j.get("status", {}).get("phase") == "Running"
+                   and j.get("metadata", {}).get("id")}
+    stale = port_cache.evict_non_running(running_ids)
+    if stale:
+        dprint(f"[dim]清理 {len(stale)} 条非 Running 端口缓存[/dim]")
 
-        # 清理缓存中已不存在于本次可见列表的 job ID
-        current_ids = {j.get("metadata", {}).get("id", "") for j in jobs if j.get("metadata", {}).get("id")}
-        stale_ids = [k for k in list(cache.keys()) if k not in current_ids]
-        if stale_ids:
-            for k in stale_ids:
-                del cache[k]
-            dprint(f"[dim]清理 {len(stale_ids)} 条过期 detail 缓存[/dim]")
-
-        # 对每个 job：从缓存取 endpoints；缓存未命中则拉取 detail 并缓存 endpoints
-        # job 对象本身（status/duration 等）始终保持列表接口返回的新鲜值，不被替换
-        fetched_count = 0
-        hit_count = 0
-        endpoints_map = {}   # {job_id: endpoints_dict}，本轮使用
-        for j in jobs:
-            job_id = j.get("metadata", {}).get("id", "")
-            if not job_id:
-                continue
-            if job_id in cache:
-                endpoints_map[job_id] = cache[job_id]
-                hit_count += 1
-            else:
-                fetched = api.get_job(job_id)
-                if fetched:
-                    ep = fetched.get("endpoints", {})
-                    endpoints_map[job_id] = ep
-                    # 只有当 endpoints 中确实包含 SSH 端口信息时才写入缓存。
-                    # 若 task_urls 为空，说明端口尚未分配，下次仍需重新拉取，
-                    # 不能将"没有端口"这一临时状态当作确定结果缓存下来。
-                    has_port = bool(ep.get("ssh", {}).get("task_urls"))
-                    if has_port:
-                        cache[job_id] = ep
-                    fetched_count += 1
-                # 拉取失败则 endpoints_map 中无此 key，后续会降级为空 SSH
-
-        # 将更新后的缓存写回（只存 endpoints）
-        save_detail_cache(cache)
-        dprint(f"[dim]detail 缓存：命中 {hit_count} 条，新拉取 {fetched_count} 条[/dim]")
+    ssh_map: dict = {}   # {job_id: [entries]}
+    hit_count = fetched_count = 0
+    for j in jobs:
+        job_id = j.get("metadata", {}).get("id", "")
+        phase  = j.get("status",   {}).get("phase", "")
+        if not job_id:
+            continue
+        before = port_cache.get(job_id)
+        ssh_map[job_id] = resolve_ssh(api, job_id, phase, port_cache)
+        if before is not None:
+            hit_count += 1
+        elif phase == "Running":
+            fetched_count += 1
+    port_cache.save()
+    dprint(f"[dim]端口缓存：命中 {hit_count} 条，新拉取 {fetched_count} 条[/dim]")
 
     if getattr(args, "json", False):
-        if getattr(args, "detail", False):
-            out = []
-            for j in jobs:
-                job_id = j.get("metadata", {}).get("id", "")
-                ep = endpoints_map.get(job_id, {}) if job_id else {}
-                ssh = enrich_ssh_entries(ep.get("ssh", {}).get("task_urls", []))
-                out.append(job_to_dict(j, ssh_override=ssh))
-            _json_out(out)
-        else:
-            _json_out([job_to_dict(j) for j in jobs])
+        out = []
+        for j in jobs:
+            job_id = j.get("metadata", {}).get("id", "")
+            out.append(job_to_dict(j, ssh_override=ssh_map.get(job_id, [])))
+        _json_out(out)
         return
 
     if not jobs:
@@ -1458,62 +1698,37 @@ def cmd_list_jobs(args):
     total = data.get("total", 0)
     t = Table(title=f"训练作业（总计 {total} 个，过滤后显示 {len(jobs)} 个）",
               header_style="bold cyan", show_lines=False)
-    t.add_column("#",     width=3)
-    t.add_column("名称",  style="green", no_wrap=True, max_width=20)
-    t.add_column("ID",    style="dim",   no_wrap=True, width=40)
-    t.add_column("状态",  no_wrap=True,  width=13)
-    t.add_column("时长",  width=10)
-    t.add_column("卡数",  width=4)
-    if getattr(args, "detail", False):
-        t.add_column("SSH端口", width=12)
+    t.add_column("#",        width=3)
+    t.add_column("名称",     style="green", no_wrap=True, max_width=20)
+    t.add_column("ID",       style="dim",   no_wrap=True, width=40)
+    t.add_column("状态",     no_wrap=True,  width=13)
+    t.add_column("时长",     width=10)
+    t.add_column("卡数",     width=4)
+    t.add_column("SSH端口",  width=12)
     t.add_column("创建时间", width=17)
     t.add_column("创建者",   width=10)
 
     for i, j in enumerate(jobs, 1):
-        meta  = j.get("metadata", {})
-        st    = j.get("status",   {})
-        spec  = j.get("spec",     {})
-        phase = st.get("phase", "?")
-        color = STATUS_COLOR.get(phase, "white")
+        meta    = j.get("metadata", {})
+        st      = j.get("status",   {})
+        spec    = j.get("spec",     {})
+        phase   = st.get("phase", "?")
+        color   = STATUS_COLOR.get(phase, "white")
         gpu_num = spec.get("resource", {}).get("pool_info", {}).get("accelerator_num", "?")
-        row = [
-            str(i), meta.get("name", ""), meta.get("id", ""),
+        job_id  = meta.get("id", "")
+        t.add_row(
+            str(i), meta.get("name", ""), job_id,
             f"[{color}]{phase}[/{color}]",
             ms_to_hms(st.get("duration")), f"{gpu_num}卡",
-        ]
-        if getattr(args, "detail", False):
-            job_id = meta.get("id", "")
-            ep = endpoints_map.get(job_id, {}) if job_id else {}
-            ssh_entries = enrich_ssh_entries(ep.get("ssh", {}).get("task_urls", []))
-            row.append(ssh_ports_summary(ssh_entries))
-        row.extend([
-            ts_to_str(meta.get("create_time")), meta.get("user_name", "")
-        ])
-        t.add_row(*row)
-    console.print(t)
-    if getattr(args, "detail", False):
-        do_refresh = getattr(args, "refresh", False)
-        if do_refresh:
-            cprint("[dim]已清空缓存并重新拉取所有 detail（--refresh）[/dim]")
-        else:
-            cprint("[dim]已从 detail 缓存读取（未命中的条目已自动拉取并缓存）[/dim]")
-    else:
-        cprint("[dim]用 detail <JOB_ID> 查看 SSH 信息[/dim]")
-def cmd_detail(args):
-    # 无参数：等同于 jobs --detail
-    if not getattr(args, "job_id", None) and not getattr(args, "src_name", None):
-        import types
-        list_args = types.SimpleNamespace(
-            action=None, limit=50,
-            recent=None, running=False, failed=False,
-            terminated=False, pending=False, status=None,
-            gpu_count=None, name=None,
-            detail=True, refresh=getattr(args, "refresh", False),
-            json=getattr(args, "json", False),
+            ssh_ports_summary(ssh_map.get(job_id, [])),
+            ts_to_str(meta.get("create_time")), meta.get("user_name", ""),
         )
-        cmd_list_jobs(list_args)
-        return
-
+    console.print(t)
+    if getattr(args, "refresh", False):
+        cprint("[dim]已清空缓存并重新拉取所有端口信息（--refresh）[/dim]")
+    else:
+        cprint("[dim]端口缓存：Running 作业端口已自动缓存，--refresh 可强制重新拉取[/dim]")
+def cmd_detail(args):
     sess = _sess_or_exit()
     api  = API(sess)
 
@@ -1637,13 +1852,19 @@ def cmd_events(args):
     cprint(f"[dim]显示 {len(events)} / {total} 条事件（limit={limit}, offset={offset}）[/dim]")
 
 
-def _pick_log_task(tasks: list, preferred: str = None) -> str:
+def _pick_log_task(tasks: list, preferred: str = None, interactive: bool = False) -> str:
     if preferred:
         return preferred
     if not tasks:
         return "worker-0"
     if len(tasks) == 1:
         return tasks[0].get("task") or "worker-0"
+    if not interactive:
+        chosen = tasks[0]
+        task = chosen.get("task") or "worker-0"
+        ip   = chosen.get("ip", "")
+        dprint(f"[dim]自动选择任务：{task} {ip}（共 {len(tasks)} 个节点，可用 --task 指定）[/dim]")
+        return task
     cprint("[bold]可用任务：[/bold]")
     for i, item in enumerate(tasks, 1):
         task = item.get("task", "")
@@ -2074,10 +2295,15 @@ def _run_probes(
     task_name: str,
     filter_set: set,
     timeout: int = 60,
+    backend: str = "cloudshell",
+    ssh_entries: list = None,
+    identityfile: str = None,
+    ssh_opts: list = None,
 ) -> dict:
     """
     将 filter_set 对应的所有探针合并为一个脚本，经单次 exec 连接执行，
     返回与 _fetch_usage_result 格式兼容的 result dict。
+    backend 可为 "cloudshell"（默认）或 "ssh"。
     """
     active = [p for p in _PROBE_REGISTRY if p.filter_keys & filter_set]
     if not active:
@@ -2093,26 +2319,46 @@ def _run_probes(
         script_parts.append(f'echo "{PEND}:{p.key}"')
     script = "\n".join(script_parts)
 
-    dprint(f"[dim]probe: 运行 {[p.key for p in active]} (单次连接)[/dim]")
-    output, _ = _exec_script(sess, job_id, task_name, script, timeout=timeout)
-    _raw_debug(f"probe raw output:\n{output}")
+    dprint(f"[dim]probe: 运行 {[p.key for p in active]} (单次连接, 后端={backend})[/dim]")
 
-    metrics: dict = {}
-    for p in active:
-        section = ""
-        s_mark = f"{PSTART}:{p.key}"
-        e_mark = f"{PEND}:{p.key}"
-        if s_mark in output:
-            after = output.split(s_mark, 1)[1]
-            section = after.split(e_mark, 1)[0] if e_mark in after else after
-        kv = _probe_kv(section)
-        dprint(f"[dim]probe [{p.key}] kv={kv}[/dim]")
-        metrics.update(p.parse_fn(kv))
+    def _attempt():
+        if backend == "ssh":
+            output, _ = _exec_script_ssh_capture(
+                ssh_entries or [], script, task=task_name, timeout=timeout,
+                identityfile=identityfile, ssh_opts=ssh_opts,
+            )
+        else:
+            output, _ = _exec_script(sess, job_id, task_name, script, timeout=timeout)
+        _raw_debug(f"probe raw output:\n{output}")
+        found_any = any(f"{PSTART}:{p.key}" in output for p in active)
+        m: dict = {}
+        for p in active:
+            section = ""
+            s_mark = f"{PSTART}:{p.key}"
+            e_mark = f"{PEND}:{p.key}"
+            if s_mark in output:
+                after = output.split(s_mark, 1)[1]
+                section = after.split(e_mark, 1)[0] if e_mark in after else after
+            kv = _probe_kv(section)
+            dprint(f"[dim]probe [{p.key}] kv={kv}[/dim]")
+            m.update(p.parse_fn(kv))
+        return m, found_any
 
-    return {"job_id": job_id, "probe": True, "metrics": metrics}
+    t0 = time.monotonic()
+    metrics, found = _attempt()
+    if not found:
+        dprint("[dim]probe: 未收到输出，重试中 (1/2)...[/dim]")
+        metrics, found = _attempt()
+    if not found:
+        dprint("[dim]probe: 未收到输出，重试中 (2/2)...[/dim]")
+        metrics, _ = _attempt()
+    elapsed = time.monotonic() - t0
+
+    return {"job_id": job_id, "probe": True, "probe_backend": backend,
+            "probe_elapsed_s": round(elapsed, 2), "metrics": metrics}
 
 
-def _usage_check_exec_access(api: "API", job_id: str) -> str:
+def _usage_check_exec_access(api: "API", job_id: str, preferred_task: str = None) -> str:
     """检查 CloudShell 权限并返回 task_name，失败则 exit。"""
     status = api.get_exec_status(job_id)
     if status and isinstance(status, dict):
@@ -2121,21 +2367,38 @@ def _usage_check_exec_access(api: "API", job_id: str) -> str:
             cprint("[red]该作业 CloudShell 未就绪，无法使用 --probe[/red]")
             sys.exit(1)
     tasks = api.get_job_tasks(job_id)
-    return _pick_log_task(tasks)
+    return _pick_log_task(tasks, preferred=preferred_task)
 
 
 def cmd_usage(args):
     sess = _sess_or_exit()
     api  = API(sess)
 
-    filter_set = _parse_metrics_filter(getattr(args, "metrics", None) or [])
-    use_probe  = getattr(args, "probe", False)
+    filter_set   = _parse_metrics_filter(getattr(args, "metrics", None) or [])
+    use_probe    = getattr(args, "probe", False)
+    probe_backend = get_exec_backend() if use_probe else "cloudshell"
 
     if args.job_id:
         if use_probe:
-            task_name = _usage_check_exec_access(api, args.job_id)
+            if probe_backend == "ssh":
+                job_detail = api.get_job(args.job_id)
+                if not job_detail: sys.exit(1)
+                phase = job_detail.get("status", {}).get("phase", "")
+                port_cache = PortCache().load()
+                probe_ssh_entries = resolve_ssh(api, args.job_id, phase, port_cache,
+                                                detail_hint=job_detail)
+                port_cache.save()
+                if not probe_ssh_entries:
+                    cprint("[red]该作业暂无 SSH 信息，无法使用 SSH 后端 probe[/red]"); sys.exit(1)
+                preferred = getattr(args, "task", None)
+                task_name = preferred or probe_ssh_entries[0]["task"]
+            else:
+                probe_ssh_entries = None
+                task_name = _usage_check_exec_access(api, args.job_id,
+                                                     preferred_task=getattr(args, "task", None))
             result = _run_probes(sess, args.job_id, task_name, filter_set,
-                                 timeout=getattr(args, "timeout", 60))
+                                 timeout=getattr(args, "timeout", 60),
+                                 backend=probe_backend, ssh_entries=probe_ssh_entries)
         else:
             result = _fetch_usage_result(api, args.job_id, args.minutes, args.step)
         if getattr(args, "json", False):
@@ -2147,33 +2410,104 @@ def cmd_usage(args):
             border_style="cyan",
         ))
         if use_probe:
-            cprint("[dim][probe] 实时单点采样[/dim]")
+            pb = result.get("probe_backend", "cloudshell")
+            el = result.get("probe_elapsed_s")
+            el_str = f"  耗时 {el}s" if el is not None else ""
+            cprint(f"[dim][probe] 实时单点采样  后端={pb}{el_str}[/dim]")
         else:
             cprint(f"[dim]时间范围: 最近 {args.minutes} 分钟，step={args.step}s[/dim]")
         return
 
     jobs = api.list_jobs(limit=args.limit).get("items", [])
     running_jobs = [j for j in jobs if j.get("status", {}).get("phase") == "Running"]
-    rows = []
-    for job in running_jobs:
-        meta = job.get("metadata", {})
-        job_id = meta.get("id", "")
-        name = meta.get("name", "")
-        if use_probe:
-            task_name = _usage_check_exec_access(api, job_id)
-            u = _run_probes(sess, job_id, task_name, filter_set,
-                            timeout=getattr(args, "timeout", 60))
-        else:
-            u = _fetch_usage_result(api, job_id, args.minutes, args.step)
-        rows.append({
-            "job_id":      job_id,
-            "name":        name,
-            "cpu":         u["metrics"].get("cpu_util",              {}).get("latest"),
-            "mem":         u["metrics"].get("memory_used_megabytes", {}).get("latest"),
-            "gpu":         u["metrics"].get("gpu_util",              {}).get("latest"),
-            "gpu_mem":     u["metrics"].get("gpu_mem_used_megabytes",{}).get("latest"),
-            "gpu_devices": u["metrics"].get("gpu_devices", []),
-        })
+
+    concurrency = getattr(args, "concurrency", 8)
+    port_cache  = PortCache().load()
+    port_cache.evict_non_running({j.get("metadata", {}).get("id", "")
+                                   for j in running_jobs
+                                   if j.get("metadata", {}).get("id")})
+
+    def _fetch_one(job):
+        meta        = job.get("metadata", {})
+        st          = job.get("status",   {})
+        job_id      = meta.get("id", "")
+        name        = meta.get("name", "")
+        create_time = meta.get("create_time")          # ms timestamp
+        duration_ms = st.get("duration")               # ms
+        job_detail  = None
+        try:
+            if use_probe:
+                if probe_backend == "ssh":
+                    job_detail = api.get_job(job_id)
+                    if job_detail:
+                        phase_p = job_detail.get("status", {}).get("phase", "")
+                        probe_ssh_entries = resolve_ssh(api, job_id, phase_p,
+                                                        port_cache, detail_hint=job_detail)
+                    else:
+                        probe_ssh_entries = []
+                    preferred = getattr(args, "task", None)
+                    task_name = preferred or (probe_ssh_entries[0]["task"] if probe_ssh_entries else "worker-0")
+                else:
+                    probe_ssh_entries = None
+                    task_name = _usage_check_exec_access(api, job_id,
+                                                         preferred_task=getattr(args, "task", None))
+                u = _run_probes(sess, job_id, task_name, filter_set,
+                                timeout=getattr(args, "timeout", 60),
+                                backend=probe_backend, ssh_entries=probe_ssh_entries)
+            else:
+                u = _fetch_usage_result(api, job_id, args.minutes, args.step)
+        except Exception as e:
+            dprint(f"[red]{job_id} 采集失败: {e}[/red]")
+            u = {"metrics": {}}
+
+        # SSH 端口：从共享 PortCache 读取（probe SSH 模式下 resolve_ssh 已更新缓存）
+        port_entries = port_cache.get(job_id) or []
+        ssh_port = ssh_ports_summary(port_entries)
+
+        return {
+            "job_id":       job_id,
+            "name":         name,
+            "ssh_port":     ssh_port,
+            "create_time":  int(create_time) if create_time is not None else 0,
+            "duration_ms":  int(duration_ms) if duration_ms is not None else 0,
+            "collected_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "cpu":          u["metrics"].get("cpu_util",              {}).get("latest"),
+            "mem":          u["metrics"].get("memory_used_megabytes", {}).get("latest"),
+            "gpu":          u["metrics"].get("gpu_util",              {}).get("latest"),
+            "gpu_mem":      u["metrics"].get("gpu_mem_used_megabytes",{}).get("latest"),
+            "gpu_devices":  u["metrics"].get("gpu_devices", []),
+        }
+
+    import concurrent.futures
+    rows_map = {}
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total}"),
+        console=console,
+        transient=True,
+    ) as progress:
+        ptask = progress.add_task(
+            f"采集中（并发={concurrency}）...", total=len(running_jobs)
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+            fut_to_idx = {pool.submit(_fetch_one, job): i
+                          for i, job in enumerate(running_jobs)}
+            for fut in concurrent.futures.as_completed(fut_to_idx):
+                idx = fut_to_idx[fut]
+                rows_map[idx] = fut.result()
+                progress.advance(ptask)
+
+    port_cache.save()
+    rows = sorted(
+        (rows_map[i] for i in range(len(running_jobs))),
+        key=lambda r: r["create_time"], reverse=True,
+    )
+
+    # 为 JSON/显示补充格式化字段
+    for r in rows:
+        r["create_time_str"] = ts_to_str(r["create_time"]) if r["create_time"] else "--"
+        r["duration_str"]    = ms_to_hms(r["duration_ms"])  if r["duration_ms"]  else "--"
 
     if getattr(args, "json", False):
         _json_out({
@@ -2183,19 +2517,41 @@ def cmd_usage(args):
         })
         return
 
+    def _gpu_color(util, vram_used_mb, vram_total_mb):
+        """Green = idle (util==0 AND vram<3%); Red = heavy; Yellow = in-use."""
+        vram_pct = vram_used_mb / vram_total_mb if vram_total_mb else 0
+        if util == 0 and vram_pct < 0.03:
+            return "green"
+        if util >= 0.8 or vram_pct >= 0.8:
+            return "red"
+        return "yellow"
+
     def _fmt_gpu_cell(r):
         devs = r.get("gpu_devices", [])
         if devs:
-            return " / ".join(f"GPU{d['index']} {d['util']*100:.0f}%" for d in devs)
+            parts = []
+            for d in devs:
+                color = _gpu_color(d.get("util", 0) or 0,
+                                   d.get("vram_used_mb", 0) or 0,
+                                   d.get("vram_total_mb", 1) or 1)
+                parts.append(f"[{color}]GPU{d['index']} {(d.get('util') or 0)*100:.0f}%[/{color}]")
+            return "\n".join(parts)
         return _fmt_usage_value("gpu_util", r["gpu"])
 
     def _fmt_vram_cell(r):
         devs = r.get("gpu_devices", [])
         if devs:
-            return " / ".join(
-                f"GPU{d['index']} {d['vram_used_mb']:.0f}/{d['vram_total_mb']:.0f}MB"
-                for d in devs
-            )
+            parts = []
+            for d in devs:
+                color = _gpu_color(d.get("util", 0) or 0,
+                                   d.get("vram_used_mb", 0) or 0,
+                                   d.get("vram_total_mb", 1) or 1)
+                parts.append(
+                    f"[{color}]GPU{d['index']} "
+                    f"{d.get('vram_used_mb') or 0:.0f}/{d.get('vram_total_mb') or 0:.0f}MB"
+                    f"[/{color}]"
+                )
+            return "\n".join(parts)
         return _fmt_usage_value("gpu_mem_used_megabytes", r["gpu_mem"])
 
     # 多作业表格：按 filter_set 决定显示哪些列
@@ -2207,13 +2563,22 @@ def cmd_usage(args):
     ]
     active_cols = [(label, fmt) for key, label, fmt in col_defs if key in filter_set]
 
-    t = Table(title="Running 作业最近 usage", header_style="bold cyan")
+    t = Table(title="Running 作业最近 usage", header_style="bold cyan", show_lines=True)
     t.add_column("名称", style="green")
     t.add_column("JOB_ID", style="dim")
+    t.add_column("SSH端口", style="cyan", no_wrap=True)
+    t.add_column("创建时间", style="dim", no_wrap=True)
+    t.add_column("运行时长", style="dim", no_wrap=True)
     for label, _ in active_cols:
         t.add_column(label)
+    t.add_column("采集时间", style="dim", no_wrap=True)
     for row in rows:
-        t.add_row(row["name"], row["job_id"], *[fmt(row) for _, fmt in active_cols])
+        t.add_row(
+            row["name"], row["job_id"], row.get("ssh_port", "—"),
+            row.get("create_time_str", "--"), row.get("duration_str", "--"),
+            *[fmt(row) for _, fmt in active_cols],
+            row.get("collected_at", ""),
+        )
     console.print(t)
     if use_probe:
         cprint("[dim]仅显示 Running 作业最近 usage；[probe] 实时单点采样[/dim]")
@@ -2329,7 +2694,7 @@ def cmd_shell(args):
             sys.exit(1)
 
     tasks = api.get_job_tasks(args.job_id)
-    task_name = _pick_log_task(tasks, preferred=args.task)
+    task_name = _pick_log_task(tasks, preferred=args.task, interactive=True)
 
     dprint("[cyan]正在连接 CloudShell...[/cyan]")
     sock = _open_exec_ws(sess, args.job_id, task_name, command="/bin/bash")
@@ -2531,10 +2896,10 @@ def _exec_script(
     threading.Thread(target=_reader,    daemon=True).start()
     threading.Thread(target=_heartbeat, daemon=True).start()
 
-    time.sleep(0.4)
+    time.sleep(0.8)
     for line in setup_lines:
         _ws_send_frame(sock, b"\x00" + line.encode(), opcode=2)
-        time.sleep(0.02)
+        time.sleep(0.05)
 
     done.wait(timeout=timeout)
     if not done.is_set():
@@ -2555,8 +2920,122 @@ def _exec_script(
     return clean, exit_code[0] if exit_code[0] is not None else -1
 
 
+def _build_ssh_cmd(ssh_entries: list, task: str = None,
+                   identityfile: str = None, ssh_opts: list = None) -> "tuple[list, str, str, int]":
+    """构造 SSH 命令基础参数，返回 (ssh_base_cmd, user, host, port)。
+    ssh_entries 为已 enrich 的列表（来自 resolve_ssh）。
+    """
+    if not ssh_entries:
+        cprint("[red]该作业暂无 SSH 信息，无法使用 SSH 后端[/red]")
+        sys.exit(1)
+    if task:
+        entry = next((e for e in ssh_entries if e.get("task") == task), None)
+        if entry is None:
+            cprint(f"[red]未找到任务：{task}，可用：{[e['task'] for e in ssh_entries]}[/red]")
+            sys.exit(1)
+    else:
+        entry = ssh_entries[0]
+        if len(ssh_entries) > 1:
+            dprint(f"[dim]自动选择 {entry['task']}（共 {len(ssh_entries)} 个节点，可用 --task 指定）[/dim]")
+    user, host, port = _parse_ssh_url(entry["url"])
+    if not host:
+        cprint(f"[red]无法解析 SSH URL：{entry['url']}[/red]")
+        sys.exit(1)
+    if not identityfile:
+        _, default = load_identityfiles()
+        identityfile = default
+    if not identityfile:
+        cprint("[red]未指定 SSH 密钥，请用 --identityfile 或 macli identityfile default --set <PATH>[/red]")
+        sys.exit(1)
+    identity_path = resolve_identityfile(identityfile)
+    cmd = ["ssh", "-p", str(port), "-i", identity_path,
+           "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+           "-o", "LogLevel=ERROR", "-o", "BatchMode=yes"]
+    if ssh_opts:
+        cmd += ssh_opts
+    return cmd, user, host, port
+
+
+def _exec_script_ssh_capture(
+    ssh_entries: list,
+    script: str,
+    task: str = None,
+    timeout: int = 300,
+    cwd: str = None,
+    identityfile: str = None,
+    ssh_opts: list = None,
+) -> "tuple[str, int]":
+    """通过 SSH 执行脚本并捕获输出，返回 (stdout文本, exit_code)。用于 probe 等需要解析输出的场景。"""
+    ssh_base, user, host, _ = _build_ssh_cmd(ssh_entries, task=task,
+                                              identityfile=identityfile, ssh_opts=ssh_opts)
+    if cwd:
+        cwd_esc = cwd.replace("'", "'\\''")
+        remote_cmd = f"cd '{cwd_esc}' && bash -s"
+    else:
+        remote_cmd = "bash -s"
+    cmd = ssh_base + [f"{user}@{host}", remote_cmd]
+    dprint(f"[dim]{' '.join(cmd)}[/dim]")
+    try:
+        result = _subprocess.run(cmd, input=script.encode(),
+                                 stdout=_subprocess.PIPE, stderr=_subprocess.PIPE,
+                                 timeout=timeout)
+        return result.stdout.decode("utf-8", errors="replace"), result.returncode
+    except _subprocess.TimeoutExpired:
+        return "", -1
+    except Exception as e:
+        dprint(f"[red]SSH capture 失败: {e}[/red]")
+        return "", -1
+
+
+def _exec_script_ssh(
+    ssh_entries: list,
+    script: str,
+    task: str = None,
+    timeout: int = 300,
+    cwd: str = None,
+    identityfile: str = None,
+    ssh_opts: list = None,
+) -> int:
+    """通过原生 SSH 执行脚本，stdout/stderr 直接流向终端，返回 exit_code。"""
+    ssh_base, user, host, _ = _build_ssh_cmd(ssh_entries, task=task,
+                                              identityfile=identityfile, ssh_opts=ssh_opts)
+    if cwd:
+        cwd_esc = cwd.replace("'", "'\\''")
+        remote_cmd = f"cd '{cwd_esc}' && bash -s"
+    else:
+        remote_cmd = "bash -s"
+    ssh_cmd = ssh_base + [f"{user}@{host}", remote_cmd]
+    dprint(f"[dim]{' '.join(ssh_cmd)}[/dim]")
+    try:
+        result = _subprocess.run(ssh_cmd, input=script.encode(), timeout=timeout)
+        return result.returncode
+    except _subprocess.TimeoutExpired:
+        cprint(f"[red]SSH 执行超时（{timeout}s）[/red]")
+        return -1
+    except Exception as e:
+        cprint(f"[red]SSH 执行失败: {e}[/red]")
+        return -1
+
+
 def cmd_exec(args):
-    """通过 CloudShell WebSocket 执行任意远程命令，重定向 stdout/stderr 到本地。"""
+    """在作业容器内执行命令，支持 cloudshell 和 ssh 两种后端。"""
+
+    # ── 确定并记忆后端 ─────────────────────────────────────────
+    backend_arg = getattr(args, "backend", None)
+    if backend_arg:
+        set_exec_backend(backend_arg)
+        backend = backend_arg
+    else:
+        backend = get_exec_backend()
+
+    # 无 JOB_ID：仅保存后端设置后退出
+    if not getattr(args, "job_id", None):
+        if backend_arg:
+            cprint(f"[green]✓ 默认 exec 后端已设为：{backend}[/green]")
+        else:
+            cprint(f"当前 exec 后端：[cyan]{backend}[/cyan]")
+        return
+
     sess = _sess_or_exit()
     api  = API(sess)
 
@@ -2579,7 +3058,32 @@ def cmd_exec(args):
         cprint("[red]请指定命令：使用 -- <cmd>、--script <file> 或 --stdin[/red]")
         sys.exit(1)
 
-    # ── 检查 exec 权限 ─────────────────────────────────────────
+    dprint(f"[dim]exec 后端：{backend}[/dim]")
+
+    timeout = getattr(args, "timeout", 300)
+    cwd     = getattr(args, "cwd", None)
+    task    = getattr(args, "task", None)
+
+    # ── SSH 后端 ───────────────────────────────────────────────
+    if backend == "ssh":
+        job = api.get_job(args.job_id)
+        if not job:
+            sys.exit(1)
+        phase = job.get("status", {}).get("phase", "")
+        port_cache = PortCache().load()
+        ssh_entries = resolve_ssh(api, args.job_id, phase, port_cache, detail_hint=job)
+        port_cache.save()
+        if not ssh_entries:
+            cprint("[red]该作业暂无 SSH 信息，无法使用 SSH 后端[/red]"); sys.exit(1)
+        code = _exec_script_ssh(
+            ssh_entries, script,
+            task=task, timeout=timeout, cwd=cwd,
+            identityfile=getattr(args, "identityfile", None),
+            ssh_opts=getattr(args, "ssh_opts", None),
+        )
+        sys.exit(code)
+
+    # ── CloudShell 后端（默认）────────────────────────────────
     status = api.get_exec_status(args.job_id)
     if status and isinstance(status, dict):
         access = (status.get("access") or {}).get("allow")
@@ -2588,13 +3092,12 @@ def cmd_exec(args):
             sys.exit(1)
 
     tasks     = api.get_job_tasks(args.job_id)
-    task_name = _pick_log_task(tasks, preferred=getattr(args, "task", None))
+    task_name = _pick_log_task(tasks, preferred=task)
 
     dprint(f"[cyan]正在连接（task={task_name}）...[/cyan]")
     output, code = _exec_script(
         sess, args.job_id, task_name, script,
-        timeout=getattr(args, "timeout", 300),
-        cwd=getattr(args, "cwd", None),
+        timeout=timeout, cwd=cwd,
     )
     dprint("[green]✓ 完成[/green]")
 
@@ -2767,7 +3270,234 @@ def cmd_delete(args):
 
     cprint(f"[green]完成：{ok_count}/{len(jobs_info)} 个作业已删除[/green]")
 
-def main():
+
+def cmd_identityfile(args):
+    files, default = load_identityfiles()
+
+    if args.if_cmd == "add":
+        path = str(Path(args.path).expanduser())
+        if not os.path.exists(path):
+            cprint(f"[yellow]警告：文件不存在：{path}[/yellow]")
+        name = args.name if args.name else Path(path).stem
+        if name in files and files[name] != path:
+            cprint(f"[yellow]名称 '{name}' 已存在（{files[name]}），将被覆盖[/yellow]")
+        files[name] = path
+        # 若尚无默认，自动设为第一个添加的
+        if default is None:
+            default = name
+        save_identityfiles(files, default)
+        cprint(f"[green]✓ 已添加：{name} → {path}[/green]")
+        if default == name:
+            cprint(f"[dim]（已设为默认密钥）[/dim]")
+
+    elif args.if_cmd == "remove":
+        name = args.name
+        if name not in files:
+            cprint(f"[red]未找到密钥：{name}[/red]")
+            sys.exit(1)
+        del files[name]
+        if default == name:
+            default = next(iter(files), None)
+            if default:
+                cprint(f"[yellow]默认密钥已更新为：{default}[/yellow]")
+            else:
+                cprint("[yellow]已无默认密钥[/yellow]")
+        save_identityfiles(files, default)
+        cprint(f"[green]✓ 已移除：{name}[/green]")
+
+    elif args.if_cmd == "list":
+        if not files:
+            cprint("[dim]暂无已保存的 SSH 密钥[/dim]")
+            return
+        t = Table(header_style="bold cyan", show_lines=False)
+        t.add_column("名称", style="cyan")
+        t.add_column("路径")
+        t.add_column("默认", width=4)
+        for n, p in files.items():
+            mark = "[green]✓[/green]" if n == default else ""
+            exists_hint = "" if os.path.exists(Path(p).expanduser()) else " [red](文件不存在)[/red]"
+            t.add_row(n, p + exists_hint, mark)
+        console.print(t)
+
+    elif args.if_cmd == "default":
+        if args.set:
+            name_or_path = args.set
+            # 若是已知名称
+            if name_or_path in files:
+                default = name_or_path
+            else:
+                # 视为路径，自动以文件名为键添加（若未注册）
+                path = str(Path(name_or_path).expanduser())
+                stem = Path(name_or_path).stem
+                if stem not in files:
+                    files[stem] = path
+                default = stem
+            save_identityfiles(files, default)
+            cprint(f"[green]✓ 默认密钥已设为：{default} ({files.get(default, name_or_path)})[/green]")
+        else:
+            if default and default in files:
+                cprint(f"默认密钥：[cyan]{default}[/cyan] → {files[default]}")
+            elif default:
+                cprint(f"默认密钥名称：[cyan]{default}[/cyan]（未在列表中，将直接用作路径）")
+            else:
+                cprint("[dim]未设置默认密钥，可用 macli identityfile default --set <PATH/NAME>[/dim]")
+
+
+def cmd_ssh(args):
+    sess = _sess_or_exit()
+    api  = API(sess)
+
+    job = api.get_job(args.job_id)
+    if not job:
+        sys.exit(1)
+    phase = job.get("status", {}).get("phase", "")
+
+    port_cache = PortCache().load()
+    ssh_list = resolve_ssh(api, args.job_id, phase, port_cache, detail_hint=job)
+    port_cache.save()
+
+    if not ssh_list:
+        cprint("[red]该作业暂无 SSH 信息（未运行或不是调试模式）[/red]")
+        sys.exit(1)
+
+    if args.task:
+        entry = next((e for e in ssh_list if e.get("task") == args.task), None)
+        if entry is None:
+            cprint(f"[red]未找到任务：{args.task}，可用：{[e['task'] for e in ssh_list]}[/red]")
+            sys.exit(1)
+    elif len(ssh_list) == 1:
+        entry = ssh_list[0]
+    else:
+        cprint("[bold]可用 SSH 节点：[/bold]")
+        for i, e in enumerate(ssh_list, 1):
+            cprint(f"  [cyan]{i}.[/cyan] {e['task']}  [dim]{e['url']}[/dim]")
+        while True:
+            choice = input(f"\n请选择节点 (1-{len(ssh_list)}): ").strip()
+            if choice.isdigit() and 1 <= int(choice) <= len(ssh_list):
+                entry = ssh_list[int(choice) - 1]
+                break
+            cprint("[red]输入无效，请重试[/red]")
+
+    ssh_base, user, host, port = _build_ssh_cmd(
+        ssh_list, task=args.task,
+        identityfile=getattr(args, "identityfile", None),
+        ssh_opts=getattr(args, "ssh_opts", None),
+    )
+    ssh_cmd = ssh_base + [f"{user}@{host}"]
+    # ssh mode: no remote command (interactive shell), drop BatchMode
+    ssh_cmd = [a for a in ssh_cmd if a != "BatchMode=yes"]
+
+    cprint(f"[dim]连接：{entry['task']}  {' '.join(ssh_cmd)}[/dim]")
+    os.execvp("ssh", ssh_cmd)
+
+
+def cmd_autologin(args):
+    """查询/启用/停用会话过期时的自动重新登录（keyring 账号密码 + ntfy OTP 通道）。"""
+    import getpass as _getpass
+    import secrets as _secrets
+
+    action = getattr(args, "action", None) or "status"
+
+    # ── status ────────────────────────────────────────────────
+    if action == "status":
+        cfg = _load_auto_login_cfg()
+        if not cfg.get("enabled"):
+            cprint("[yellow]自动登录：[bold]未启用[/bold][/yellow]")
+        else:
+            cprint("[green]自动登录：[bold]已启用[/bold][/green]")
+            cprint(f"  ntfy topic : [cyan]{cfg.get('ntfy_topic', '—')}[/cyan]")
+            cprint(f"  最大重试次数: {cfg.get('max_retries', 3)}")
+            cprint(f"  验证码等待 : {cfg.get('otp_wait_secs', 120)} 秒")
+        creds = _load_saved_creds()
+        if creds.get("username"):
+            cprint(f"  keyring 账号: [dim]{creds['username']} @ {creds['domain']}[/dim]")
+        else:
+            cprint("  keyring 账号: [dim]未保存[/dim]")
+        return
+
+    # ── disable ───────────────────────────────────────────────
+    if action == "disable":
+        cfg = _load_auto_login_cfg()
+        cfg["enabled"] = False
+        _save_auto_login_cfg(cfg)
+        cprint("[green]✓ 自动登录已停用[/green]")
+        return
+
+    # ── enable ────────────────────────────────────────────────
+    creds = _load_saved_creds()
+    if not (creds.get("domain") and creds.get("username") and creds.get("password")):
+        cprint("[yellow]keyring 中无账号密码，请输入：[/yellow]")
+        _domain   = input("租户名/原华为云账号: ").strip()
+        _username = input("IAM 用户名/邮件地址: ").strip()
+        _password = _getpass.getpass("IAM 用户密码: ")
+        if not all([_domain, _username, _password]):
+            cprint("[red]账号信息不完整，取消[/red]")
+            return
+        if _save_creds(_domain, _username, _password):
+            cprint("[green]✓ 账号密码已保存至 keyring[/green]")
+        else:
+            cprint("[red]keyring 保存失败，无法启用自动登录[/red]")
+            return
+    else:
+        cprint(f"[green]✓ 使用 keyring 账号：{creds['username']} @ {creds['domain']}[/green]")
+
+    # 生成或复用 ntfy_topic
+    cfg = _load_auto_login_cfg()
+    existing_topic = cfg.get("ntfy_topic", "")
+    if getattr(args, "reset_topic", False) or not existing_topic:
+        # 16 hex chars = 64 bit 熵，与其他用户碰撞概率极低
+        ntfy_topic = "macli-" + _secrets.token_hex(8)
+        dprint(f"[dim]生成新 ntfy topic: {ntfy_topic}[/dim]")
+    else:
+        ntfy_topic = existing_topic
+        dprint(f"[dim]复用已有 ntfy topic: {ntfy_topic}[/dim]")
+
+    max_retries = getattr(args, "retries",  None) or int(cfg.get("max_retries",  3))
+    otp_timeout = getattr(args, "timeout",  None) or int(cfg.get("otp_wait_secs", 120))
+
+    cfg.update({
+        "enabled":       True,
+        "ntfy_topic":    ntfy_topic,
+        "max_retries":   max_retries,
+        "otp_wait_secs": otp_timeout,
+    })
+    _save_auto_login_cfg(cfg)
+    cprint("[bold green]✓ 自动登录已启用[/bold green]")
+
+    # 打印 iPhone 快捷指令配置指南
+    ntfy_url = f"https://ntfy.sh/{ntfy_topic}"
+    ntfy_publish_url = "https://ntfy.sh"
+    console.print(Panel(
+        f"[bold]iPhone 快捷指令配置（推荐：整条短信原文直传）[/bold]\n\n"
+        f"[bold cyan]推荐 URL[/bold cyan]\n"
+        f"  {ntfy_url}\n\n"
+        f"[bold cyan]方法[/bold cyan]\n"
+        f"  POST\n\n"
+        f"[bold cyan]Headers（可选）[/bold cyan]\n"
+        f"  Content-Type  →  text/plain; charset=utf-8\n\n"
+        f"[bold cyan]请求体[/bold cyan]\n"
+        f"  [yellow]<整条短信原文 / 转成纯文本后的快捷指令输入>[/yellow]\n\n"
+        f"[dim]macli 会在收到的消息正文里自动提取首个 6 位数字验证码，无需手机端先做正则。[/dim]\n\n"
+        f"---\n\n"
+        f"[bold]建议快捷指令流程：[/bold]\n"
+        f"  1. 触发条件：收到含「验证码」的短信\n"
+        f"  2. 用 [获取文本] 把“快捷指令输入”转换成纯文本\n"
+        f"  3. [获取URL内容] → POST {ntfy_url}\n"
+        f"     Header: Content-Type = text/plain; charset=utf-8\n"
+        f"     请求体: [yellow]<上一步得到的整条短信文本>[/yellow]\n\n"
+        f"[bold]备用方案（若你更想发 JSON）[/bold]\n"
+        f"  URL: {ntfy_publish_url}\n"
+        f"  Header: Content-Type = application/json\n"
+        f"  JSON 请求体: topic = [cyan]{ntfy_topic}[/cyan]\n"
+        f"                 message = [yellow]<整条短信文本>[/yellow]",
+        title="[bold]自动登录 — 手机快捷指令配置指南[/bold]",
+        border_style="cyan",
+        padding=(1, 2),
+    ))
+    cprint(f"\n[dim]配置已保存。ntfy topic 请妥善保管（泄露后他人可读取验证码）[/dim]")
+
+
+def _main_impl():
     p = argparse.ArgumentParser(
         prog="modelarts",
         description="华为云 ModelArts CLI",
@@ -2789,8 +3519,8 @@ macli workspace select  # 交互式选择当前workspace
 macli workspace select --name <WORKSPACE_NAME>
 macli workspace select --id <WORKSPACE_ID>
 
-macli jobs [filters...] [--limit LIMIT] [--detail] [--json]  # 列出作业列表，支持多种过滤条件
-macli jobs [filters...] [--detail] [--refresh] [--json]      # --refresh 清空 detail 缓存并重新拉取
+macli jobs [filters...] [--limit LIMIT] [--json]  # 列出作业列表，支持多种过滤条件（默认显示 SSH 端口）
+macli jobs [filters...] [--refresh] [--json]      # --refresh 清空端口缓存并重新拉取
 macli jobs count [filters...] [--json] # 仅返回满足过滤条件的作业数量
 
 # jobs filters:
@@ -2804,8 +3534,15 @@ macli detail --name <JOB_NAME> [--json]
 
 macli events <JOB_ID> [--limit LIMIT] [--offset OFFSET] [--json]
 macli log <JOB_ID> --output <OUTPUT_PATH> [--task TASK]
-macli usage [<JOB_ID>] [--minutes N] [--step N] [--json]
+macli usage [<JOB_ID>] [--minutes N] [--step N] [--probe [--task TASK]] [--json]
+macli jobs [filters...]              # 默认显示 SSH 端口（Running 作业自动缓存）
+macli jobs [filters...] --refresh   # 清空端口缓存并重新拉取
 macli shell <JOB_ID> [--task TASK]
+macli ssh <JOB_ID> [--task TASK] [--identityfile PATH/NAME]
+macli identityfile add <PATH> [--name/-n <NAME>]
+macli identityfile remove <NAME>
+macli identityfile list
+macli identityfile default [--set <PATH/NAME>]
 macli exec <JOB_ID> -- <cmd> [args...]
 macli exec <JOB_ID> --script <file> [--cwd <dir>]
 macli exec <JOB_ID> --stdin [--cwd <dir>]
@@ -2834,6 +3571,16 @@ macli delete <JOB_ID> [-y | --yes] [-f | --force]  # -f/--force 会强制删除�
                    help="登录后交互式选择 region 和 workspace")
 
     sub.add_parser("logout", help="清除已保存的登录凭据（config/session.json）")
+
+    q = sub.add_parser("autologin", help="管理会话过期时的自动重新登录")
+    q.add_argument("action", nargs="?", choices=["enable", "disable", "status"],
+                   default="status", help="操作：status（默认）/ enable / disable")
+    q.add_argument("--retries",     type=int, default=None, metavar="N",
+                   help="最大重试次数，默认 3")
+    q.add_argument("--timeout",     type=int, default=None, metavar="SECS",
+                   help="每次等待手机验证码的超时秒数，默认 120")
+    q.add_argument("--reset-topic", dest="reset_topic", action="store_true",
+                   help="重新生成 ntfy topic（原快捷指令配置将失效）")
 
     q = sub.add_parser("whoami", help="显示当前登录状态")
     q.add_argument("--json", action="store_true", help="JSON 输出")
@@ -2871,20 +3618,16 @@ macli delete <JOB_ID> [-y | --yes] [-f | --force]  # -f/--force 会强制删除�
                    metavar="N",    help="按 GPU 卡数过滤，支持多选")
     q.add_argument("--name",       dest="name",      default=None,
                    metavar="NAME", help="按作业名称精确过滤")
-    q.add_argument("--detail",     action="store_true",
-                   help="对过滤后的每个作业额外拉取 detail；表格会显示 SSH 端口，JSON 会并入详情字段；优先使用本地缓存")
     q.add_argument("--refresh",    action="store_true",
-                   help="与 --detail 配合使用：清空所有缓存，强制重新拉取所有符合条件的 detail 并重建缓存")
+                   help="清空 SSH 端口缓存，强制重新拉取所有 Running 作业的端口信息")
     q.add_argument("--json",       action="store_true", help="JSON 输出")
 
-    q = sub.add_parser("detail", help="作业详情 + SSH 信息；无参数时等同于 jobs --detail")
-    grp = q.add_mutually_exclusive_group(required=False)
+    q = sub.add_parser("detail", help="查看作业详情及 SSH 信息（直接调用 API）")
+    grp = q.add_mutually_exclusive_group(required=True)
     grp.add_argument("job_id",     metavar="JOB_ID",  nargs="?", default=None,
-                     help="作业 ID；省略则列出所有作业（含 detail）")
+                     help="作业 ID")
     grp.add_argument("--name",     dest="src_name",   default=None,
                      help="按作业名称查找（取最新一个）")
-    q.add_argument("--refresh",    action="store_true",
-                   help="清空 detail 缓存并强制重新拉取（仅无参数模式有效）")
     q.add_argument("--json", action="store_true", help="JSON 输出")
 
     q = sub.add_parser("events", help="作业事件详情")
@@ -2905,10 +3648,13 @@ macli delete <JOB_ID> [-y | --yes] [-f | --force]  # -f/--force 会强制删除�
     q.add_argument("--minutes", type=int, default=15, help="最近多少分钟，默认 15")
     q.add_argument("--step", type=int, default=60, help="采样步长（秒），默认 60")
     q.add_argument("--limit", type=int, default=50, help="无 JOB_ID 时，最多检查多少个作业，默认 50")
+    q.add_argument("--concurrency", "-c", type=int, default=8,
+                   metavar="N", help="无 JOB_ID 时的并发采集数，默认 8")
     q.add_argument("--metrics", "-m", nargs="+", metavar="METRIC",
                    help="只显示指定指标，可多选：cpu mem gpu vram（默认全部）")
     q.add_argument("--probe", action="store_true",
                    help="通过 CloudShell exec 直接从容器内采集指标（不走监控 API）")
+    q.add_argument("--task", default=None, help="--probe 时指定任务名，例如 worker-0；默认自动选第一个")
     q.add_argument("--timeout", type=int, default=60,
                    help="--probe 模式下的采集超时秒数，默认 60")
     q.add_argument("--json", action="store_true", help="JSON 输出")
@@ -2917,6 +3663,25 @@ macli delete <JOB_ID> [-y | --yes] [-f | --force]  # -f/--force 会强制删除�
     q.add_argument("job_id", metavar="JOB_ID", help="作业 ID")
     q.add_argument("--task", default=None, help="任务名，例如 worker-0；默认自动选择")
     q.add_argument("--heartbeat", type=float, default=2.0, help="空闲时发送心跳包的间隔秒数，默认 2")
+
+    q = sub.add_parser("ssh", help="通过原生 SSH 连接作业容器")
+    q.add_argument("job_id", metavar="JOB_ID", help="作业 ID")
+    q.add_argument("--task", default=None, help="任务名，例如 worker-0；默认自动选择")
+    q.add_argument("--identityfile", "-i", dest="identityfile", default=None,
+                   metavar="PATH/NAME", help="SSH 私钥路径或已保存密钥名称；不指定则使用默认密钥")
+    q.add_argument("--opt", "-o", dest="ssh_opts", action="append", default=None,
+                   metavar="SSH_OPTION", help="追加额外 SSH 选项，例如 -o StrictHostKeyChecking=no（可多次使用）")
+
+    # identityfile 子命令
+    _if = sub.add_parser("identityfile", help="管理 SSH 密钥配置").add_subparsers(dest="if_cmd", required=True)
+    q = _if.add_parser("add", help="添加 SSH 密钥")
+    q.add_argument("path", metavar="PATH", help="密钥文件路径")
+    q.add_argument("--name", "-n", default=None, help="可选别名；不指定则使用文件名（不含扩展名）")
+    q = _if.add_parser("remove", help="移除已保存的 SSH 密钥")
+    q.add_argument("name", metavar="NAME", help="密钥名称")
+    _if.add_parser("list", help="列出所有已保存的 SSH 密钥")
+    q = _if.add_parser("default", help="查看或设置默认 SSH 密钥")
+    q.add_argument("--set", default=None, metavar="PATH/NAME", help="设置默认密钥（路径或已保存名称）")
 
     q = sub.add_parser("exec", help="在作业容器内执行命令并输出结果",
                        formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2930,11 +3695,23 @@ macli delete <JOB_ID> [-y | --yes] [-f | --force]  # -f/--force 会强制删除�
   macli exec JOB_ID --stdin << 'EOF'
   for f in /cache/*.log; do echo "$f"; done
   EOF
+
+  # 切换到 SSH 后端（记忆，后续无需再加 --backend）
+  macli exec JOB_ID --backend ssh -- nvidia-smi
+  macli exec JOB_ID --backend cloudshell -- nvidia-smi
+  macli exec --backend ssh        # 仅切换默认后端，不执行命令
 """)
-    q.add_argument("job_id", metavar="JOB_ID", help="作业 ID")
+    q.add_argument("job_id", metavar="JOB_ID", nargs="?", default=None,
+                   help="作业 ID；省略时仅保存 --backend 设置")
     q.add_argument("--task",    default=None, help="任务名，例如 worker-0；默认自动选择")
     q.add_argument("--cwd",     default=None, metavar="DIR", help="执行命令前先切换到指定目录")
     q.add_argument("--timeout", type=int, default=300, help="等待命令结束的超时秒数，默认 300")
+    q.add_argument("--backend", choices=["cloudshell", "ssh"], default=None,
+                   help="执行后端：cloudshell（默认）或 ssh；指定后自动记忆，下次无需重复")
+    q.add_argument("--identityfile", "-i", dest="identityfile", default=None,
+                   metavar="PATH/NAME", help="SSH 后端：私钥路径或已保存名称；不指定则使用默认密钥")
+    q.add_argument("--opt", "-o", dest="ssh_opts", action="append", default=None,
+                   metavar="SSH_OPTION", help="SSH 后端：追加额外 SSH 选项（可多次使用）")
     src = q.add_mutually_exclusive_group()
     src.add_argument("--script", dest="script_file", default=None, metavar="FILE",
                      help="从本地文件读取要执行的脚本")
@@ -2981,7 +3758,16 @@ macli delete <JOB_ID> [-y | --yes] [-f | --force]  # -f/--force 会强制删除�
     q.add_argument("-f", "--force", action="store_true", help="强制删除（包括运行中的作业）")
     q.add_argument("-y", "--yes",   action="store_true")
 
-    args = p.parse_args()
+    # parse_known_args：让子解析器先处理已知参数，remaining 用于处理
+    # "exec JOB_ID -- cmd args" 中 -- 被 argparse 顶层提前消费的已知 bug
+    args, _remaining = p.parse_known_args()
+    if _remaining:
+        if getattr(args, "cmd", None) == "exec":
+            # 合并剩余参数（去掉前导 --）
+            extra = _remaining[1:] if _remaining[0] == "--" else _remaining
+            args.inline_cmd = list(getattr(args, "inline_cmd", None) or []) + extra
+        else:
+            p.error(f"unrecognized arguments: {' '.join(_remaining)}")
 
     # --command 中支持字面 \n 转换为真正换行
     if hasattr(args, "command") and args.command:
@@ -2994,25 +3780,46 @@ macli delete <JOB_ID> [-y | --yes] [-f | --force]  # -f/--force 会强制删除�
         {"list": cmd_region_list, "select": cmd_region_select}[args.rg_cmd](args)
     elif args.cmd == "workspace":
         {"list": cmd_workspace_list, "select": cmd_workspace_select}[args.ws_cmd](args)
+    elif args.cmd == "identityfile":
+        cmd_identityfile(args)
     else:
-        {"login":     cmd_login,
-         "logout":    cmd_logout,
-         "whoami":    cmd_whoami,
-         "jobs":      cmd_list_jobs,
-         "detail":    cmd_detail,
-         "events":    cmd_events,
-         "log":       cmd_log,
-         "usage":     cmd_usage,
-         "shell":     cmd_shell,
-         "exec":      cmd_exec,
-         "copy":      cmd_copy,
-         "stop":      cmd_stop,
-         "delete":    cmd_delete}[args.cmd](args)
+        {"login":        cmd_login,
+         "logout":       cmd_logout,
+         "autologin":    cmd_autologin,
+         "whoami":       cmd_whoami,
+         "jobs":         cmd_list_jobs,
+         "detail":       cmd_detail,
+         "events":       cmd_events,
+         "log":          cmd_log,
+         "usage":        cmd_usage,
+         "shell":        cmd_shell,
+         "ssh":          cmd_ssh,
+         "exec":         cmd_exec,
+         "copy":         cmd_copy,
+         "stop":         cmd_stop,
+         "delete":       cmd_delete}[args.cmd](args)
 
-if __name__ == "__main__":
+
+def main():
     try:
-        main()
+        return _main_impl()
     except SessionExpiredError as e:
+        cfg = _load_auto_login_cfg()
+        if cfg.get("enabled"):
+            dprint(f"[dim]SessionExpiredError: {e}，触发自动登录[/dim]")
+            ok = _do_auto_login(cfg)
+            if ok:
+                # 自动登录成功：用相同参数重新执行本进程
+                dprint(f"[dim]重新执行: {sys.argv}[/dim]")
+                os.execvp(sys.argv[0], sys.argv)
+                return 0
+            console.print("[bold red]✗ 自动重新登录失败[/bold red]，请手动执行 [bold]macli login[/bold]")
+            return 2
+
         console.print(f"\n[bold red]✗ 登录已过期[/bold red]  {e}")
         console.print("[yellow]请重新执行：[/yellow] [bold]macli login[/bold]")
-        sys.exit(2)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
