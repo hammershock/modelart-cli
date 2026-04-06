@@ -2755,20 +2755,24 @@ def cmd_usage(args):
     sess = _sess_or_exit()
     api  = API(sess)
 
-    filter_set   = _parse_metrics_filter(getattr(args, "metrics", None) or [])
-    use_probe    = getattr(args, "probe", False)
+    use_probe     = getattr(args, "probe", False)
     probe_backend = get_exec_backend() if use_probe else "cloudshell"
+    filter_set    = _parse_metrics_filter(getattr(args, "metrics", None) or [])
 
     if args.job_id:
         if use_probe:
             if probe_backend == "ssh":
-                job_detail = api.get_job(args.job_id)
-                if not job_detail: sys.exit(1)
-                phase = job_detail.get("status", {}).get("phase", "")
                 port_cache = PortCache().load()
-                probe_ssh_entries = resolve_ssh(api, args.job_id, phase, port_cache,
-                                                detail_hint=job_detail)
-                port_cache.save()
+                try:
+                    job_detail = api.get_job(args.job_id)
+                    if not job_detail: sys.exit(1)
+                    phase = job_detail.get("status", {}).get("phase", "")
+                    probe_ssh_entries = resolve_ssh(api, args.job_id, phase, port_cache,
+                                                    detail_hint=job_detail)
+                    port_cache.save()
+                except SessionExpiredError:
+                    cprint("[yellow]WARN: session 已失效，使用缓存 SSH 端口进行探测[/yellow]")
+                    probe_ssh_entries = port_cache.get(args.job_id)
                 if not probe_ssh_entries:
                     cprint("[red]该作业暂无 SSH 信息，无法使用 SSH 后端 probe[/red]"); sys.exit(1)
                 preferred = getattr(args, "task", None)
@@ -2799,14 +2803,27 @@ def cmd_usage(args):
             cprint(f"[dim]时间范围: 最近 {args.minutes} 分钟，step={args.step}s[/dim]")
         return
 
-    jobs = api.list_jobs(limit=args.limit).get("items", [])
-    running_jobs = [j for j in jobs if j.get("status", {}).get("phase") == "Running"]
-
-    concurrency = getattr(args, "concurrency", 8)
     port_cache  = PortCache().load()
-    port_cache.evict_non_running({j.get("metadata", {}).get("id", "")
-                                   for j in running_jobs
-                                   if j.get("metadata", {}).get("id")})
+    concurrency = getattr(args, "concurrency", 8)
+    # degraded[0] = True when session is expired; set on first SessionExpiredError
+    degraded = [False]
+
+    try:
+        jobs = api.list_jobs(limit=args.limit).get("items", [])
+        running_jobs = [j for j in jobs if j.get("status", {}).get("phase") == "Running"]
+        port_cache.evict_non_running({j.get("metadata", {}).get("id", "")
+                                       for j in running_jobs
+                                       if j.get("metadata", {}).get("id")})
+    except SessionExpiredError:
+        if use_probe and probe_backend == "ssh":
+            cprint("[yellow]WARN: session 已失效，使用缓存 SSH 端口进行探测[/yellow]")
+            degraded[0] = True
+            running_jobs = [
+                {"metadata": {"id": jid, "name": jid[:8]}, "status": {"phase": "Running"}}
+                for jid in port_cache._data
+            ]
+        else:
+            raise
 
     def _fetch_one(job):
         meta        = job.get("metadata", {})
@@ -2815,17 +2832,23 @@ def cmd_usage(args):
         name        = meta.get("name", "")
         create_time = meta.get("create_time")          # ms timestamp
         duration_ms = st.get("duration")               # ms
-        job_detail  = None
         try:
             if use_probe:
                 if probe_backend == "ssh":
-                    job_detail = api.get_job(job_id)
-                    if job_detail:
-                        phase_p = job_detail.get("status", {}).get("phase", "")
-                        probe_ssh_entries = resolve_ssh(api, job_id, phase_p,
-                                                        port_cache, detail_hint=job_detail)
+                    if not degraded[0]:
+                        try:
+                            job_detail = api.get_job(job_id)
+                            if job_detail:
+                                phase_p = job_detail.get("status", {}).get("phase", "")
+                                probe_ssh_entries = resolve_ssh(api, job_id, phase_p,
+                                                                port_cache, detail_hint=job_detail)
+                            else:
+                                probe_ssh_entries = []
+                        except SessionExpiredError:
+                            degraded[0] = True
+                            probe_ssh_entries = port_cache.get(job_id) or []
                     else:
-                        probe_ssh_entries = []
+                        probe_ssh_entries = port_cache.get(job_id) or []
                     preferred = getattr(args, "task", None)
                     task_name = preferred or (probe_ssh_entries[0]["task"] if probe_ssh_entries else "worker-0")
                 else:
