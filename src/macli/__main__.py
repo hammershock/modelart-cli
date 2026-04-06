@@ -2324,6 +2324,8 @@ def cmd_log(args):
         sys.exit(1)
 
     outpath = Path(args.output).expanduser()
+    if outpath.is_dir():
+        outpath = outpath / f"{args.job_id[:8]}_{task_name}.log"
     resp = api.download_from_obs_url(obs_url, timeout=args.timeout)
     if resp.status_code != 200:
         cprint(f"[red]日志下载失败 {resp.status_code}[/red]")
