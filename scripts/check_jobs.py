@@ -135,7 +135,7 @@ def check(threshold_hours: int = DEFAULT_THRESHOLD_H):
                     "copy", src["id"],
                     "--gpu-count", "1",
                     "--name",      new_name,
-                    "--desc",      "自动保活作业（macli watch 创建）",
+                    "--desc",      "自动保活作业 macli watch",
                     "--command-file", str(STARTUP_SCRIPT),
                     "--json", "--yes",
                 ]
@@ -145,7 +145,7 @@ def check(threshold_hours: int = DEFAULT_THRESHOLD_H):
                     "copy", src["id"],
                     "--gpu-count", "1",
                     "--name",      new_name,
-                    "--desc",      "自动保活作业（macli watch 创建）",
+                    "--desc",      "自动保活作业 macli watch",
                     "--command",   "sleep 2000000000s;",
                     "--json", "--yes",
                 ]
@@ -215,9 +215,23 @@ if __name__ == "__main__":
 """,
     )
     p.add_argument(
-        "--threshold-hours", type=int, default=DEFAULT_THRESHOLD_H,
+        "--threshold-hours", type=int, default=None,
         metavar="N",
-        help=f"Terminated 作业终止多少小时后删除（默认 {DEFAULT_THRESHOLD_H}）",
+        help=f"Terminated 作业终止多少小时后删除（默认读取 macli watch 配置，回退 {DEFAULT_THRESHOLD_H}）",
     )
     args = p.parse_args()
-    check(threshold_hours=args.threshold_hours)
+
+    threshold = args.threshold_hours
+    if threshold is None:
+        try:
+            cfg_file = CONFIG_DIR / "session.json"
+            if cfg_file.exists():
+                threshold = json.loads(cfg_file.read_text(encoding="utf-8")).get(
+                    "watch", {}
+                ).get("threshold_hours", DEFAULT_THRESHOLD_H)
+            else:
+                threshold = DEFAULT_THRESHOLD_H
+        except Exception:
+            threshold = DEFAULT_THRESHOLD_H
+
+    check(threshold_hours=threshold)
