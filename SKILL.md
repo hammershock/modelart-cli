@@ -6,6 +6,7 @@ description: 通过 `macli` 命令行工具管理华为云 ModelArts
 ### 命令选型：
 - login 登录
 - autologin 管理会话过期时的自动重新登录（含 ntfy 推送）
+- watch 定时检查任务：保活（无 Pending 时自动复制）+ 清理 Terminated 作业
 - whoami 显示当前登录用户信息
 - region 切换和显示当前region
 - workspace 切换和显示当前workspace
@@ -48,6 +49,14 @@ macli workspace select --id <WORKSPACE_ID>
 
 macli autologin [status|enable|disable] [--retries N] [--timeout SECS] [--reset-topic]
 # status（默认）查看配置；enable/disable 开关自动重登；--reset-topic 重新生成 ntfy 推送 topic
+
+macli watch [status|enable|disable|run] [--interval H] [--script PATH] [--threshold-hours N]
+# status（默认）  查看运行状态和上次检查时间
+# enable         注册 launchd 定时任务（需 --script 首次指定 check_jobs.py 路径）
+# disable        卸载 launchd 任务
+# run            立即执行一次检查（用于测试）
+# --interval     检查间隔（小时），默认 1
+# --threshold-hours  Terminated 作业保留时长（小时），默认 72
 
 macli jobs [filters...] [--limit LIMIT] [--refresh] [--json]  # 列出作业列表，支持多种过滤条件（含 SSH 端口）
 macli jobs count [filters...] [--json]  # 仅返回满足过滤条件的作业数量
@@ -213,3 +222,21 @@ macli query --running | macli exec -- nvidia-smi
 # 与 xargs 组合（当需要并行执行时）：
 macli query --running | xargs -P4 -I{} macli exec {} -- nvidia-smi
 ```
+❯ 现在需要：
+  固定间隔时间，去做检查：
+  每次检查包含：
+  如果当前没有pending的任务，就从一个运行的复制过来一个新的，名字随机，卡数覆盖为1，启动脚本设置为：
+  [Pasted text #2 +3 lines]
+  sleep 2000000000s;
+
+  如果当前存在Terminated的任务，且没有终止时刻的记录，就记录当前时刻为终止时刻。
+  如果现在超过终止时刻一定阈值，比如72h,就删除这个已经终止的工作。
+
+  项目中设置日志文件目录，让全局范围内执行的macli命令均有日志记录到文件中内容为：以条目记录每个命令的执行结果状态
+  [level]: [timestamp]: [command] [args] - [exit code] [message]
+   其中 status 包含：success, failure, skipped 等，message 可选，记录错误信息或其他备注
+   例如：
+   INFO: 2024-06-01T12:00:00Z: macli jobs --running - success - Found 3 running jobs
+   ERROR: 2024-06-01T12:05:00Z: macli ssh abc12345 - failure - SSH connection timed out
+  在项目逻辑中添加更多的debug记录点，以便更好地追踪和诊断问题。
+  让这个任务固化为脚本，然后添加macli命令入口，（可以根据macli命令去管理这个任务）
