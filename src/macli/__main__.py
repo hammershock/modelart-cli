@@ -566,17 +566,23 @@ def enrich_ssh_entries(entries: list) -> list:
     return out
 
 
-def ssh_ports_summary(entries: list) -> str:
-    """用于 jobs 表格展示 SSH 端口。多个端口去重后以逗号连接；缺失返回 —。"""
+def ssh_ports_list(entries: list) -> list:
+    """提取并去重 SSH 端口列表，返回 int 列表。"""
     ports = []
     for item in entries or []:
         port = item.get("port")
         if port is None:
             port = ssh_url_to_port(item.get("url", ""))
         if port is not None:
-            ports.append(str(port))
-    ports = list(dict.fromkeys(ports))
-    return ",".join(ports) if ports else "—"
+            ports.append(int(port))
+    return list(dict.fromkeys(ports))
+
+
+
+def ssh_ports_summary(entries: list) -> str:
+    """用于表格展示 SSH 端口。多个端口去重后以逗号连接；缺失返回 —。"""
+    ports = ssh_ports_list(entries)
+    return ",".join(map(str, ports)) if ports else "—"
 
 # ── Session ──────────────────────────────────────────────────
 
@@ -1575,17 +1581,42 @@ def cmd_whoami(args):
         f"  ({age:.1f}h 前)",
         title="Session 状态", border_style="green"))
     
-def cmd_list_jobs(args):
-    sess = _sess_or_exit()
-    api  = API(sess)
+def _resolve_jobs_ssh_map(api: "API", jobs: list, refresh: bool = False) -> dict:
+    """为一组 jobs 解析 SSH entries，并复用 Running 作业的端口缓存。"""
+    port_cache = PortCache() if refresh else PortCache().load()
+    if refresh:
+        dprint("[dim]--refresh: 已清空端口缓存，强制重新拉取[/dim]")
 
-    # 所有过滤在本地完成，分页拉取（每页最多 50，API 硬限制）
+    running_ids = {j.get("metadata", {}).get("id", "") for j in jobs
+                   if j.get("status", {}).get("phase") == "Running"
+                   and j.get("metadata", {}).get("id")}
+    stale = port_cache.evict_non_running(running_ids)
+    if stale:
+        dprint(f"[dim]清理 {len(stale)} 条非 Running 端口缓存[/dim]")
+
+    ssh_map: dict = {}
+    hit_count = fetched_count = 0
+    for j in jobs:
+        job_id = j.get("metadata", {}).get("id", "")
+        phase  = j.get("status", {}).get("phase", "")
+        if not job_id:
+            continue
+        before = port_cache.get(job_id)
+        ssh_map[job_id] = resolve_ssh(api, job_id, phase, port_cache)
+        if before is not None:
+            hit_count += 1
+        elif phase == "Running":
+            fetched_count += 1
+    port_cache.save()
+    dprint(f"[dim]端口缓存：命中 {hit_count} 条，新拉取 {fetched_count} 条[/dim]")
+    return ssh_map
+
+
+
+def _fetch_all_jobs(api: "API", max_items: int = 500) -> list:
+    """分页拉取所有作业，最多拉取 max_items 条（API 每页限制 50）。"""
     PAGE = 50
-    need_filter = bool(args.recent or args.running or args.failed
-                       or args.terminated or args.pending or args.gpu_count
-                       or args.name or args.status)
-    jobs  = []
-    total = 0
+    jobs: list = []
     offset = 0
     while True:
         data   = api.list_jobs(limit=PAGE, offset=offset)
@@ -1593,15 +1624,34 @@ def cmd_list_jobs(args):
         page   = data.get("items", [])
         jobs  += page
         offset += len(page)
-        # 如果不需要过滤，拉够 limit 条就停
-        if not need_filter and len(jobs) >= args.limit:
+        if not page or offset >= total or offset >= max_items:
             break
-        # 没有更多了
-        if not page or offset >= total:
-            break
-        # 已经拉了足够多了（最多拉 500 条，避免无限循环）
-        if offset >= 500:
-            break
+    return jobs
+
+
+def cmd_list_jobs(args):
+    sess = _sess_or_exit()
+    api  = API(sess)
+
+    # 所有过滤在本地完成，分页拉取（每页最多 50，API 硬限制）
+    need_filter = bool(args.recent or args.running or args.failed
+                       or args.terminated or args.pending or args.gpu_count
+                       or args.name or args.status)
+    if need_filter:
+        jobs = _fetch_all_jobs(api)
+    else:
+        PAGE = 50
+        jobs  = []
+        total = 0
+        offset = 0
+        while True:
+            data   = api.list_jobs(limit=PAGE, offset=offset)
+            total  = data.get("total", 0)
+            page   = data.get("items", [])
+            jobs  += page
+            offset += len(page)
+            if len(jobs) >= args.limit or not page or offset >= total:
+                break
 
     # ── 时间过滤 ──
     if args.recent:
@@ -1656,33 +1706,7 @@ def cmd_list_jobs(args):
         return
 
     # ── SSH 端口解析（PortCache）─────────────────────────────
-    port_cache = PortCache().load()
-    if getattr(args, "refresh", False):
-        port_cache = PortCache()
-        dprint("[dim]--refresh: 已清空端口缓存，强制重新拉取[/dim]")
-
-    running_ids = {j.get("metadata", {}).get("id", "") for j in jobs
-                   if j.get("status", {}).get("phase") == "Running"
-                   and j.get("metadata", {}).get("id")}
-    stale = port_cache.evict_non_running(running_ids)
-    if stale:
-        dprint(f"[dim]清理 {len(stale)} 条非 Running 端口缓存[/dim]")
-
-    ssh_map: dict = {}   # {job_id: [entries]}
-    hit_count = fetched_count = 0
-    for j in jobs:
-        job_id = j.get("metadata", {}).get("id", "")
-        phase  = j.get("status",   {}).get("phase", "")
-        if not job_id:
-            continue
-        before = port_cache.get(job_id)
-        ssh_map[job_id] = resolve_ssh(api, job_id, phase, port_cache)
-        if before is not None:
-            hit_count += 1
-        elif phase == "Running":
-            fetched_count += 1
-    port_cache.save()
-    dprint(f"[dim]端口缓存：命中 {hit_count} 条，新拉取 {fetched_count} 条[/dim]")
+    ssh_map = _resolve_jobs_ssh_map(api, jobs, refresh=getattr(args, "refresh", False))
 
     if getattr(args, "json", False):
         out = []
@@ -1728,6 +1752,60 @@ def cmd_list_jobs(args):
         cprint("[dim]已清空缓存并重新拉取所有端口信息（--refresh）[/dim]")
     else:
         cprint("[dim]端口缓存：Running 作业端口已自动缓存，--refresh 可强制重新拉取[/dim]")
+
+
+
+def cmd_ports(args):
+    """列出当前 Running 作业的 SSH 端口信息。"""
+    sess = _sess_or_exit()
+    api  = API(sess)
+
+    jobs = [j for j in _fetch_all_jobs(api)
+            if j.get("status", {}).get("phase", "") == "Running"]
+    ssh_map = _resolve_jobs_ssh_map(api, jobs, refresh=getattr(args, "refresh", False))
+
+    if getattr(args, "json", False):
+        out = []
+        for j in jobs:
+            meta = j.get("metadata", {})
+            job_id = meta.get("id", "")
+            ssh = ssh_map.get(job_id, [])
+            out.append({
+                "id": job_id,
+                "name": meta.get("name", ""),
+                "status": "Running",
+                "ports": ssh_ports_list(ssh),
+                "ssh": ssh,
+            })
+        _json_out(out)
+        return
+
+    if not jobs:
+        cprint("[yellow]当前没有 Running 状态的训练作业[/yellow]")
+        return
+
+    t = Table(title=f"Running 作业 SSH 端口（共 {len(jobs)} 个）",
+              header_style="bold cyan", show_lines=False)
+    t.add_column("#", width=3)
+    t.add_column("名称", style="green", no_wrap=True, max_width=24)
+    t.add_column("ID", style="dim", no_wrap=True, width=40)
+    t.add_column("SSH端口", width=18)
+
+    for i, j in enumerate(jobs, 1):
+        meta = j.get("metadata", {})
+        job_id = meta.get("id", "")
+        t.add_row(
+            str(i),
+            meta.get("name", ""),
+            job_id,
+            ssh_ports_summary(ssh_map.get(job_id, [])),
+        )
+    console.print(t)
+    if getattr(args, "refresh", False):
+        cprint("[dim]已清空缓存并重新拉取所有 Running 作业的端口信息（--refresh）[/dim]")
+    else:
+        cprint("[dim]端口缓存：Running 作业端口已自动缓存，--refresh 可强制重新拉取[/dim]")
+
 def cmd_detail(args):
     sess = _sess_or_exit()
     api  = API(sess)
@@ -3522,6 +3600,7 @@ macli workspace select --id <WORKSPACE_ID>
 macli jobs [filters...] [--limit LIMIT] [--json]  # 列出作业列表，支持多种过滤条件（默认显示 SSH 端口）
 macli jobs [filters...] [--refresh] [--json]      # --refresh 清空端口缓存并重新拉取
 macli jobs count [filters...] [--json] # 仅返回满足过滤条件的作业数量
+macli ports [--refresh] [--json]       # 查看当前 Running 作业的 SSH 端口
 
 # jobs filters:
 #   [--name <NAME>]
@@ -3621,6 +3700,11 @@ macli delete <JOB_ID> [-y | --yes] [-f | --force]  # -f/--force 会强制删除�
     q.add_argument("--refresh",    action="store_true",
                    help="清空 SSH 端口缓存，强制重新拉取所有 Running 作业的端口信息")
     q.add_argument("--json",       action="store_true", help="JSON 输出")
+
+    q = sub.add_parser("ports", help="查看当前 Running 作业的 SSH 端口")
+    q.add_argument("--refresh", action="store_true",
+                   help="清空 SSH 端口缓存，强制重新拉取所有 Running 作业的端口信息")
+    q.add_argument("--json", action="store_true", help="JSON 输出（list）")
 
     q = sub.add_parser("detail", help="查看作业详情及 SSH 信息（直接调用 API）")
     grp = q.add_mutually_exclusive_group(required=True)
@@ -3788,6 +3872,7 @@ macli delete <JOB_ID> [-y | --yes] [-f | --force]  # -f/--force 会强制删除�
          "autologin":    cmd_autologin,
          "whoami":       cmd_whoami,
          "jobs":         cmd_list_jobs,
+         "ports":        cmd_ports,
          "detail":       cmd_detail,
          "events":       cmd_events,
          "log":          cmd_log,
