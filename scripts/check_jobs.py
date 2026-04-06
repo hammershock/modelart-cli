@@ -80,11 +80,17 @@ def _macli_cmd() -> list:
     return [sys.executable, "-m", "macli"]
 
 def macli(*args) -> tuple:
-    """运行 macli 命令，返回 (stdout, returncode)。"""
+    """运行 macli 命令，返回 (stdout, returncode)。失败时记录错误输出。"""
     cmd    = _macli_cmd() + [str(a) for a in args]
     result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0 and result.stderr.strip():
-        error(f"macli {' '.join(str(a) for a in args[:2])}: {result.stderr.strip()[:200]}")
+    if result.returncode != 0:
+        # stdout 含有 Rich 格式的错误消息（如 "创建失败 400: ..."）
+        out_snippet = result.stdout.strip()[:400]
+        err_snippet = result.stderr.strip()[:200]
+        if out_snippet:
+            error(f"macli output: {out_snippet}")
+        if err_snippet:
+            error(f"macli stderr: {err_snippet}")
     return result.stdout.strip(), result.returncode
 
 def get_jobs() -> list:
@@ -123,6 +129,7 @@ def check(threshold_hours: int = DEFAULT_THRESHOLD_H):
             suffix   = "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
             new_name = f"keeper-{suffix}"
 
+            # 用 --json 确保能解析结果，且跳过交互预览
             if STARTUP_SCRIPT.exists():
                 copy_args = [
                     "copy", src["id"],
@@ -130,7 +137,7 @@ def check(threshold_hours: int = DEFAULT_THRESHOLD_H):
                     "--name",      new_name,
                     "--desc",      "自动保活作业（macli watch 创建）",
                     "--command-file", str(STARTUP_SCRIPT),
-                    "--yes",
+                    "--json", "--yes",
                 ]
             else:
                 warn(f"未找到 startup.sh（{STARTUP_SCRIPT}），使用默认 sleep 命令")
@@ -140,12 +147,18 @@ def check(threshold_hours: int = DEFAULT_THRESHOLD_H):
                     "--name",      new_name,
                     "--desc",      "自动保活作业（macli watch 创建）",
                     "--command",   "sleep 2000000000s;",
-                    "--yes",
+                    "--json", "--yes",
                 ]
 
-            _, code = macli(*copy_args)
+            out, code = macli(*copy_args)
             if code == 0:
-                info(f"已复制：{src['name']} → {new_name}（1 卡）")
+                try:
+                    created = json.loads(out)
+                    new_id  = created.get("id", "?")
+                    phase   = created.get("status", "?")
+                    info(f"已复制：{src['name']} → {new_name} (id={new_id[:8]}… phase={phase})")
+                except (json.JSONDecodeError, AttributeError):
+                    info(f"已复制：{src['name']} → {new_name}（无法解析返回 JSON）")
             else:
                 error(f"复制失败（源：{src['name']} / {src['id'][:8]}…）")
     else:

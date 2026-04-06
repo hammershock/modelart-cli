@@ -951,8 +951,12 @@ class API:
             body.setdefault("algorithm", {})["command"] = command
 
         r = self.sess.post("/training-jobs", body)
+        dprint(f"[dim]API copy_job → {r.status_code}[/dim]")
         if r.status_code in (200, 201):
-            return self._safe_json(r)
+            created = self._safe_json(r)
+            dprint(f"[dim]  新作业 ID={created.get('metadata',{}).get('id','?')} phase={created.get('status',{}).get('phase','?')}[/dim]")
+            return created
+        dprint(f"[dim]  error body: {r.text[:400]}[/dim]")
         cprint(f"[red]创建失败 {r.status_code}: {r.text[:400]}[/red]")
         return {}
 
@@ -3615,6 +3619,7 @@ def cmd_copy(args):
             cprint(f"  状态: {result.get('status',{}).get('phase','等待中')}")
     else:
         cprint("[red]创建失败[/red]")
+        sys.exit(1)
 
 
 def cmd_stop(args):
