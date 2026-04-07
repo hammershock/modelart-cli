@@ -24,6 +24,7 @@ description: 通过 `macli` 命令行工具管理华为云 ModelArts
 - copy 以一个作业为模板创建新作业, 可以选择覆盖GPU数量、命令、名称和描述等
 - stop 终止作业，支持多 ID 和管道输入
 - delete 彻底删除作业，支持多 ID 和管道输入
+- server 管理 HTTP 状态服务（FastAPI + launchd），提供 /gpu、/ports、/log、/health 等接口
 
 ### 全局选项：
 ```bash
@@ -57,6 +58,20 @@ macli watch [status|enable|disable|run] [--interval H] [--script PATH] [--thresh
 # run            立即执行一次检查（用于测试）
 # --interval     检查间隔（小时），默认 1
 # --threshold-hours  Terminated 作业保留时长（小时），默认 72
+
+macli server [status|enable|disable|run] [--port PORT]
+# status（默认）  查看 server 运行状态
+# enable         注册 launchd 常驻服务（KeepAlive=true）
+# disable        卸载 launchd 服务
+# run            前台直接运行（调试用）
+# --port         监听端口，默认 8086
+# HTTP 接口：
+#   GET /gpu          GPU 实时状态（macli usage --probe，10s 缓存）
+#   GET /ports        Running 作业 SSH 端口列表 JSON（30s 缓存）
+#   GET /log          macli 日志（最近 1000 行）
+#   GET /watch-log    watch 日志（最近 1000 行）
+#   GET /server-log   server 自身请求日志（最近 1000 行）
+#   GET /health       macli/watch/autologin/exec 状态 JSON（3s 缓存）
 
 macli jobs [filters...] [--limit LIMIT] [--refresh] [--json]  # 列出作业列表，支持多种过滤条件（含 SSH 端口）
 macli jobs count [filters...] [--json]  # 仅返回满足过滤条件的作业数量
@@ -159,6 +174,10 @@ macli exec e40422c7-f151-4cba-982f-957c368071e3 -- nvidia-smi  # 在容器内执
 macli exec e40422c7-f151-4cba-982f-957c368071e3 --script run.sh  # 执行本地脚本
 macli exec e40422c7-f151-4cba-982f-957c368071e3 --backend ssh -- nvidia-smi  # 通过 SSH 后端执行
 macli autologin enable  # 开启会话过期自动重登
+macli server enable --port 8086  # 启动 HTTP 状态服务（launchd 常驻）
+macli server status              # 查看 server 状态
+curl localhost:8086/health       # 查看 macli/watch/autologin/exec 状态 JSON
+curl localhost:8086/gpu          # 查看 GPU 实时状态（终端 ANSI 彩色）
 macli copy --src-name template --gpu-count 1 --name "my-exp" --desc "1卡实验" --command "mkdir /cache\\nsleep 2000000000s;" --yes  # 以名为template的作业为模板创建一个新作业，覆盖GPU数量和启动命令，并跳过确认提示
 macli copy e40422c7-f151-4cba-982f-957c368071e3 --gpu-count 2 --name "my-exp-2" --desc "2卡实验" --command-file start.sh --yes  # 以指定ID的作业为模板创建一个新作业，覆盖GPU数量和启动命令，并跳过确认提示
 macli stop e40422c7-f151-4cba-982f-957c368071e3 --yes  # 停止一个正在运行的作业，跳过确认提示
@@ -222,21 +241,3 @@ macli query --running | macli exec -- nvidia-smi
 # 与 xargs 组合（当需要并行执行时）：
 macli query --running | xargs -P4 -I{} macli exec {} -- nvidia-smi
 ```
-❯ 现在需要：
-  固定间隔时间，去做检查：
-  每次检查包含：
-  如果当前没有pending的任务，就从一个运行的复制过来一个新的，名字随机，卡数覆盖为1，启动脚本设置为：
-  [Pasted text #2 +3 lines]
-  sleep 2000000000s;
-
-  如果当前存在Terminated的任务，且没有终止时刻的记录，就记录当前时刻为终止时刻。
-  如果现在超过终止时刻一定阈值，比如72h,就删除这个已经终止的工作。
-
-  项目中设置日志文件目录，让全局范围内执行的macli命令均有日志记录到文件中内容为：以条目记录每个命令的执行结果状态
-  [level]: [timestamp]: [command] [args] - [exit code] [message]
-   其中 status 包含：success, failure, skipped 等，message 可选，记录错误信息或其他备注
-   例如：
-   INFO: 2024-06-01T12:00:00Z: macli jobs --running - success - Found 3 running jobs
-   ERROR: 2024-06-01T12:05:00Z: macli ssh abc12345 - failure - SSH connection timed out
-  在项目逻辑中添加更多的debug记录点，以便更好地追踪和诊断问题。
-  让这个任务固化为脚本，然后添加macli命令入口，（可以根据macli命令去管理这个任务）
