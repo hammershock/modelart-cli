@@ -2169,9 +2169,9 @@ def _server_run(args):
         return "text/html" in accept and "text/plain" not in accept
 
     # ── 请求日志 ────────────────────────────────────────────
-    def _log_req(method: str, path: str, status: int, ms: float):
+    def _log_req(method: str, path: str, status: int, ms: float, ip: str = "-"):
         ts   = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        line = f"{ts} {method} {path} {status} {ms:.0f}ms"
+        line = f"{ts} {ip} {method} {path} {status} {ms:.0f}ms"
         with _srv_log_lock:
             _srv_log.append(line)
             if len(_srv_log) > 10000:
@@ -2330,8 +2330,11 @@ def _server_run(args):
             status = 500
             raise
         finally:
+            ip = (req.headers.get("x-forwarded-for") or
+                  req.headers.get("x-real-ip") or
+                  (req.client.host if req.client else "-"))
             _log_req(req.method, req.url.path, status,
-                     (time.monotonic() - t0) * 1000)
+                     (time.monotonic() - t0) * 1000, ip)
         return resp
 
     @app.get("/gpu", response_class=_Plain)
