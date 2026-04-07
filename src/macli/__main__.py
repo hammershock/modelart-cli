@@ -1676,6 +1676,8 @@ _WATCH_KEY         = "watch"
 _WATCH_PLIST_LABEL = "com.macli.watch"
 _WATCH_PLIST_PATH  = Path.home() / "Library" / "LaunchAgents" / f"{_WATCH_PLIST_LABEL}.plist"
 _WATCH_STATE_FILE  = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "macli" / "watch_state.json"
+_WATCH_CRON_MARKER = "# macli-watch"
+_IS_LINUX          = sys.platform.startswith("linux")
 
 
 def _load_watch_cfg() -> dict:
@@ -1729,6 +1731,42 @@ def _launchctl_is_loaded() -> bool:
     return r.returncode == 0
 
 
+def _cron_get_lines() -> list:
+    r = _subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    if r.returncode != 0:
+        return []
+    return [l for l in r.stdout.splitlines() if l]
+
+
+def _cron_set_lines(lines: list):
+    text = "\n".join(lines) + "\n"
+    _subprocess.run(["crontab", "-"], input=text, text=True, check=True)
+
+
+def _cron_watch_is_active() -> bool:
+    return any(_WATCH_CRON_MARKER in l for l in _cron_get_lines())
+
+
+def _cron_watch_install(interval_h: float, script_path: str,
+                        threshold_hours: int, log_path: str):
+    lines = [l for l in _cron_get_lines() if _WATCH_CRON_MARKER not in l]
+    if interval_h >= 1 and interval_h == int(interval_h):
+        cron_expr = f"0 */{int(interval_h)} * * *"
+    else:
+        mins = max(1, int(interval_h * 60))
+        cron_expr = f"*/{mins} * * * *"
+    entry = (f"{cron_expr} {sys.executable} {script_path}"
+             f" --threshold-hours {threshold_hours} >> {log_path} 2>&1"
+             f" {_WATCH_CRON_MARKER}")
+    lines.append(entry)
+    _cron_set_lines(lines)
+
+
+def _cron_watch_remove():
+    lines = [l for l in _cron_get_lines() if _WATCH_CRON_MARKER not in l]
+    _cron_set_lines(lines)
+
+
 def cmd_watch(args):
     action = getattr(args, "watch_action", "status")
     if action == "enable":
@@ -1743,14 +1781,22 @@ def cmd_watch(args):
 
 def _watch_status():
     cfg    = _load_watch_cfg()
-    loaded = _launchctl_is_loaded()
-
-    if cfg.get("enabled") and loaded:
-        cprint("[green]watch：[bold]已启用（launchd 运行中）[/bold][/green]")
-    elif cfg.get("enabled") and not loaded:
-        cprint("[yellow]watch：已配置但 launchd 未加载（建议重新 enable）[/yellow]")
+    if _IS_LINUX:
+        active = _cron_watch_is_active()
+        if cfg.get("enabled") and active:
+            cprint("[green]watch：[bold]已启用（cron 运行中）[/bold][/green]")
+        elif cfg.get("enabled") and not active:
+            cprint("[yellow]watch：已配置但 cron 条目未找到（建议重新 enable）[/yellow]")
+        else:
+            cprint("[dim]watch：未启用[/dim]")
     else:
-        cprint("[dim]watch：未启用[/dim]")
+        loaded = _launchctl_is_loaded()
+        if cfg.get("enabled") and loaded:
+            cprint("[green]watch：[bold]已启用（launchd 运行中）[/bold][/green]")
+        elif cfg.get("enabled") and not loaded:
+            cprint("[yellow]watch：已配置但 launchd 未加载（建议重新 enable）[/yellow]")
+        else:
+            cprint("[dim]watch：未启用[/dim]")
 
     if cfg:
         cprint(f"  检查脚本  : [dim]{cfg.get('script_path', '—')}[/dim]")
@@ -1798,42 +1844,55 @@ def _watch_enable(args):
                                           Path.home() / ".config")) / "macli" / "watch.log")
     interval_s = int(interval_h * 3600)
 
-    # 写 plist
-    _WATCH_PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _launchctl("unload")   # 先卸载（忽略失败）
-    _WATCH_PLIST_PATH.write_text(
-        _watch_plist_xml(interval_s, str(script_path), threshold_hours, log_path),
-        encoding="utf-8",
-    )
+    cfg = {
+        "enabled":         True,
+        "interval_h":      interval_h,
+        "script_path":     str(script_path),
+        "threshold_hours": threshold_hours,
+        "log_path":        log_path,
+    }
 
-    if _launchctl("load"):
-        cfg = {
-            "enabled":         True,
-            "interval_h":      interval_h,
-            "script_path":     str(script_path),
-            "threshold_hours": threshold_hours,
-            "log_path":        log_path,
-        }
+    if _IS_LINUX:
+        Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+        _cron_watch_install(interval_h, str(script_path), threshold_hours, log_path)
         _save_watch_cfg(cfg)
-        cprint(f"[green]✓ watch 已启用，每 {interval_h}h 执行一次[/green]")
+        cprint(f"[green]✓ watch 已启用，每 {interval_h}h 执行一次（cron）[/green]")
         cprint(f"  脚本：{script_path}")
         cprint(f"  日志：{log_path}")
-        cprint(f"  plist：{_WATCH_PLIST_PATH}")
     else:
-        cprint("[red]launchctl load 失败[/red]")
-        cprint(f"  plist：{_WATCH_PLIST_PATH}")
-        sys.exit(1)
+        # 写 plist
+        _WATCH_PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _launchctl("unload")   # 先卸载（忽略失败）
+        _WATCH_PLIST_PATH.write_text(
+            _watch_plist_xml(interval_s, str(script_path), threshold_hours, log_path),
+            encoding="utf-8",
+        )
+
+        if _launchctl("load"):
+            _save_watch_cfg(cfg)
+            cprint(f"[green]✓ watch 已启用，每 {interval_h}h 执行一次[/green]")
+            cprint(f"  脚本：{script_path}")
+            cprint(f"  日志：{log_path}")
+            cprint(f"  plist：{_WATCH_PLIST_PATH}")
+        else:
+            cprint("[red]launchctl load 失败[/red]")
+            cprint(f"  plist：{_WATCH_PLIST_PATH}")
+            sys.exit(1)
 
 
 def _watch_disable():
-    _launchctl("unload")
-    if _WATCH_PLIST_PATH.exists():
-        _WATCH_PLIST_PATH.unlink()
+    if _IS_LINUX:
+        _cron_watch_remove()
+        cprint("[green]✓ watch 已停用，cron 条目已移除[/green]")
+    else:
+        _launchctl("unload")
+        if _WATCH_PLIST_PATH.exists():
+            _WATCH_PLIST_PATH.unlink()
+        cprint("[green]✓ watch 已停用，launchd 任务已卸载[/green]")
 
     cfg = _load_watch_cfg()
     cfg["enabled"] = False
     _save_watch_cfg(cfg)
-    cprint("[green]✓ watch 已停用，launchd 任务已卸载[/green]")
 
 
 def _watch_run(args):
@@ -1863,6 +1922,7 @@ _SERVER_KEY         = "server"
 _SERVER_PLIST_LABEL = "com.macli.server"
 _SERVER_PLIST_PATH  = Path.home() / "Library" / "LaunchAgents" / f"{_SERVER_PLIST_LABEL}.plist"
 _SERVER_LOG_FILE    = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "macli" / "server.log"
+_SERVER_PID_FILE    = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "macli" / "server.pid"
 _MACLI_LOG_FILE     = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "macli" / "macli.log"
 
 
@@ -1909,6 +1969,47 @@ def _server_launchctl_is_loaded() -> bool:
     )
     return r.returncode == 0
 
+
+def _server_linux_is_running() -> bool:
+    if not _SERVER_PID_FILE.exists():
+        return False
+    try:
+        pid = int(_SERVER_PID_FILE.read_text(encoding="utf-8").strip())
+        os.kill(pid, 0)
+        return True
+    except (ValueError, ProcessLookupError, PermissionError):
+        return False
+
+
+def _server_linux_start(port: int) -> bool:
+    _SERVER_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _server_linux_stop()
+    log_fd = open(str(_SERVER_LOG_FILE), "a")
+    proc = _subprocess.Popen(
+        [sys.executable, "-m", "macli", "server", "run", "--port", str(port)],
+        stdout=log_fd,
+        stderr=log_fd,
+        start_new_session=True,
+        close_fds=True,
+    )
+    log_fd.close()
+    _SERVER_PID_FILE.write_text(str(proc.pid), encoding="utf-8")
+    return True
+
+
+def _server_linux_stop():
+    if not _SERVER_PID_FILE.exists():
+        return
+    try:
+        pid = int(_SERVER_PID_FILE.read_text(encoding="utf-8").strip())
+        import signal as _signal
+        os.kill(pid, _signal.SIGTERM)
+    except (ValueError, ProcessLookupError, PermissionError):
+        pass
+    finally:
+        _SERVER_PID_FILE.unlink(missing_ok=True)
+
+
 def cmd_server(args):
     action = getattr(args, "server_action", None) or "status"
     if action == "enable":
@@ -1922,14 +2023,23 @@ def cmd_server(args):
 
 def _server_status():
     cfg    = _load_server_cfg()
-    loaded = _server_launchctl_is_loaded()
     port   = cfg.get("port", 8086)
-    if cfg.get("enabled") and loaded:
-        cprint("[green]server：已启用（launchd 运行中）[/green]")
-    elif cfg.get("enabled"):
-        cprint("[yellow]server：已配置但 launchd 未运行（执行 macli server enable 重新加载）[/yellow]")
+    if _IS_LINUX:
+        running = _server_linux_is_running()
+        if cfg.get("enabled") and running:
+            cprint("[green]server：已启用（后台进程运行中）[/green]")
+        elif cfg.get("enabled"):
+            cprint("[yellow]server：已配置但进程未运行（执行 macli server enable 重新启动）[/yellow]")
+        else:
+            cprint("[dim]server：未启用[/dim]")
     else:
-        cprint("[dim]server：未启用[/dim]")
+        loaded = _server_launchctl_is_loaded()
+        if cfg.get("enabled") and loaded:
+            cprint("[green]server：已启用（launchd 运行中）[/green]")
+        elif cfg.get("enabled"):
+            cprint("[yellow]server：已配置但 launchd 未运行（执行 macli server enable 重新加载）[/yellow]")
+        else:
+            cprint("[dim]server：未启用[/dim]")
     if cfg:
         cprint(f"  端口        : {port}")
         cprint(f"  /gpu        : http://localhost:{port}/gpu")
@@ -1942,24 +2052,32 @@ def _server_status():
 
 def _server_enable(args):
     port = getattr(args, "port", None) or _load_server_cfg().get("port", 8086)
-    _SERVER_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _SERVER_PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _server_launchctl("unload")
-    _SERVER_PLIST_PATH.write_text(_server_plist_xml(port), encoding="utf-8")
-    ok = _server_launchctl("load")
     cfg = _load_server_cfg()
     cfg.update({"enabled": True, "port": port})
     _save_server_cfg(cfg)
-    if ok:
+    if _IS_LINUX:
+        _server_linux_start(port)
         cprint(f"[green]✓ server 已启用  http://localhost:{port}/gpu[/green]")
+        cprint(f"  日志：{_SERVER_LOG_FILE}")
     else:
-        cprint(f"[yellow]⚠ 配置已写入，launchctl load 返回非零（可能已在运行）[/yellow]")
-        cprint(f"  http://localhost:{port}/gpu")
+        _SERVER_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _SERVER_PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _server_launchctl("unload")
+        _SERVER_PLIST_PATH.write_text(_server_plist_xml(port), encoding="utf-8")
+        ok = _server_launchctl("load")
+        if ok:
+            cprint(f"[green]✓ server 已启用  http://localhost:{port}/gpu[/green]")
+        else:
+            cprint(f"[yellow]⚠ 配置已写入，launchctl load 返回非零（可能已在运行）[/yellow]")
+            cprint(f"  http://localhost:{port}/gpu")
 
 def _server_disable():
-    _server_launchctl("unload")
-    if _SERVER_PLIST_PATH.exists():
-        _SERVER_PLIST_PATH.unlink()
+    if _IS_LINUX:
+        _server_linux_stop()
+    else:
+        _server_launchctl("unload")
+        if _SERVER_PLIST_PATH.exists():
+            _SERVER_PLIST_PATH.unlink()
     cfg = _load_server_cfg()
     cfg["enabled"] = False
     _save_server_cfg(cfg)
@@ -2174,7 +2292,7 @@ def _server_run(args):
             srv = sess.get(_SERVER_KEY, {})
             server = {
                 "enabled": srv.get("enabled", False),
-                "launchd": _server_launchctl_is_loaded(),
+                "running": _server_linux_is_running() if _IS_LINUX else _server_launchctl_is_loaded(),
                 "port":    srv.get("port", 8086),
             }
 
@@ -2189,7 +2307,7 @@ def _server_run(args):
                 pass
             watch = {
                 "enabled":         wch.get("enabled", False),
-                "launchd":         _launchctl_is_loaded(),
+                "running":         _cron_watch_is_active() if _IS_LINUX else _launchctl_is_loaded(),
                 "interval_h":      wch.get("interval_h"),
                 "threshold_hours": wch.get("threshold_hours"),
                 "last_check":      last_check,
