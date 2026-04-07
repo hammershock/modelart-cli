@@ -2125,6 +2125,7 @@ def _server_run(args):
     from fastapi.responses import PlainTextResponse as _Plain, JSONResponse as _JSON
     from rich.console import Console as _RConsole
     from rich.table import Table as _RTable
+    from rich.text import Text as _RText
 
     _RATE_LIMIT = 10.0
     _cache_lock = _threading.Lock()
@@ -2180,8 +2181,54 @@ def _server_run(args):
             pass
 
     # ── 渲染 macli usage --probe --json → 表格 ─────────────
-    def _pct(v):  return f"{round((v or 0) * 100)}%" if v is not None else "—"
-    def _mbs(v):  return f"{round(v or 0)}"           if v is not None else "—"
+    def _fmt_pct(v):
+        return f"{round((v or 0) * 100)}%" if v is not None else "—"
+
+    def _fmt_mem(mb):
+        if mb is None:
+            return "—"
+        mb = mb or 0
+        if mb >= 1024:
+            return f"{mb / 1024:.1f}GB"
+        if mb >= 1:
+            return f"{round(mb)}MB"
+        return f"{round(mb * 1024)}KB"
+
+    def _fmt_created(ts):
+        if not ts:
+            return "—"
+        try:
+            return datetime.fromtimestamp(int(ts) / 1000).strftime("%y-%m-%d")
+        except Exception:
+            return "—"
+
+    def _fmt_dur(ms):
+        if not ms:
+            return "—"
+        try:
+            h, rem = divmod(int(ms) // 1000, 3600)
+            m, s   = divmod(rem, 60)
+            return f"{h}:{m:02d}:{s:02d}"
+        except Exception:
+            return "—"
+
+    def _dev_cell(d):
+        util       = d.get("util")
+        vram_used  = d.get("vram_used_mb")
+        vram_total = d.get("vram_total_mb")
+        text = (f"gpu{d.get('index', '?')} {_fmt_pct(util)}"
+                f" {_fmt_mem(vram_used)}/{_fmt_mem(vram_total)}")
+        if not use_ansi:
+            return text
+        u        = (util or 0) * 100
+        vram_pct = (vram_used or 0) / (vram_total or 1) * 100
+        if u == 0 and vram_pct < 3:
+            color = "green"
+        elif u > 60 or vram_pct > 60:
+            color = "red"
+        else:
+            color = "yellow"
+        return _RText(text, style=color)
 
     def _render_jobs(jobs: list, use_ansi: bool) -> str:
         if not jobs:
@@ -2193,28 +2240,31 @@ def _server_run(args):
         tbl = _RTable(show_header=True,
                       header_style="bold cyan" if use_ansi else "",
                       show_lines=False, pad_edge=False)
-        for col, kw in [("name",   dict(min_width=20, no_wrap=True)),
-                        ("ssh",    dict(width=7,      no_wrap=True)),
-                        ("cpu%",   dict(width=5,      no_wrap=True)),
-                        ("mem MB", dict(width=8,      no_wrap=True)),
-                        ("gpu%",   dict(width=5,      no_wrap=True)),
-                        ("gpu MB", dict(width=8,      no_wrap=True)),
-                        ("devices",dict(min_width=30, no_wrap=False))]:
+        for col, kw in [("job",     dict(min_width=8,  no_wrap=True)),
+                        ("ssh",     dict(width=7,       no_wrap=True)),
+                        ("cpu%",    dict(width=5,       no_wrap=True)),
+                        ("mem",     dict(width=8,       no_wrap=True)),
+                        ("created", dict(width=10,      no_wrap=True)),
+                        ("dur",     dict(width=10,      no_wrap=True)),
+                        ("devices", dict(min_width=32,  no_wrap=False))]:
             tbl.add_column(col, **kw)
         for r in jobs:
-            devs    = r.get("gpu_devices", [])
-            dev_str = " | ".join(
-                f"gpu{d.get('index','?')} {_pct(d.get('util'))} "
-                f"{_mbs(d.get('vram_used_mb'))}/{_mbs(d.get('vram_total_mb'))}MB"
-                for d in devs
-            ) or "—"
-            tbl.add_row(
-                r.get("name") or r.get("job_id", "?")[:8],
-                r.get("ssh_port") or "—",
-                _pct(r.get("cpu")), _mbs(r.get("mem")),
-                _pct(r.get("gpu")), _mbs(r.get("gpu_mem")),
-                dev_str,
-            )
+            devs      = r.get("gpu_devices", [])
+            job_short = (r.get("job_id") or "?")[:8]
+            ssh       = r.get("ssh_port") or "—"
+            cpu       = _fmt_pct(r.get("cpu"))
+            mem       = _fmt_mem(r.get("mem"))
+            created   = _fmt_created(r.get("create_time"))
+            dur       = _fmt_dur(r.get("duration_ms"))
+            if not devs:
+                tbl.add_row(job_short, ssh, cpu, mem, created, dur, "—")
+            else:
+                for i, d in enumerate(devs):
+                    cell = _dev_cell(d)
+                    if i == 0:
+                        tbl.add_row(job_short, ssh, cpu, mem, created, dur, cell)
+                    else:
+                        tbl.add_row("", "", "", "", "", "", cell)
         con.print(tbl)
         return buf.getvalue()
 
