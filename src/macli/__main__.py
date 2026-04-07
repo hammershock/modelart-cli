@@ -2458,8 +2458,19 @@ def _server_run(args):
             return []
 
         data, age = _ports_cache.get(_fetch_ports)
+        # 按创建时间累计 GPU 数，标记稳定/临时
+        _GPU_QUOTA = 8
+        sorted_asc = sorted(data, key=lambda r: r.get("create_time") or 0)
+        stable_ids: set = set()
+        _used = 0
+        for r in sorted_asc:
+            n = r.get("gpu_count") or 1
+            if _used + n <= _GPU_QUOTA:
+                stable_ids.add(r.get("id"))
+            _used += n
+        enriched = [{**r, "preemptible": r.get("id") not in stable_ids} for r in data]
         from fastapi.responses import JSONResponse as _JResp
-        return _JResp(content=data,
+        return _JResp(content=enriched,
                       headers={"X-Cache-Age": str(age)})
 
     cprint(f"[cyan]macli server  http://0.0.0.0:{port}[/cyan]")
@@ -2750,15 +2761,18 @@ def cmd_ports(args):
     if getattr(args, "json", False):
         out = []
         for j in jobs:
-            meta = j.get("metadata", {})
-            job_id = meta.get("id", "")
-            ssh = ssh_map.get(job_id, [])
+            meta    = j.get("metadata", {})
+            res     = j.get("spec", {}).get("resource", {})
+            job_id  = meta.get("id", "")
+            ssh     = ssh_map.get(job_id, [])
             out.append({
-                "id": job_id,
-                "name": meta.get("name", ""),
-                "status": "Running",
-                "ports": ssh_ports_list(ssh),
-                "ssh": ssh,
+                "id":          job_id,
+                "name":        meta.get("name", ""),
+                "status":      "Running",
+                "create_time": meta.get("create_time"),
+                "gpu_count":   res.get("pool_info", {}).get("accelerator_num") or 1,
+                "ports":       ssh_ports_list(ssh),
+                "ssh":         ssh,
             })
         _json_out(out)
         return
