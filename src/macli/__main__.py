@@ -3916,6 +3916,34 @@ def cmd_autologin(args):
         return
 
     # ── enable ────────────────────────────────────────────────
+    cfg = _load_auto_login_cfg()
+
+    # Already enabled: just apply any changed params, skip credential prompt + setup panel
+    if cfg.get("enabled"):
+        changed = False
+        if getattr(args, "retries", None) is not None:
+            cfg["max_retries"] = args.retries
+            changed = True
+        if getattr(args, "timeout", None) is not None:
+            cfg["otp_wait_secs"] = args.timeout
+            changed = True
+        if getattr(args, "reset_topic", False):
+            cfg["ntfy_topic"] = "macli-" + _secrets.token_hex(8)
+            changed = True
+        if changed:
+            _save_auto_login_cfg(cfg)
+            cprint("[green]✓ 配置已更新[/green]")
+        else:
+            cprint("[dim]自动登录已启用，无参数变更[/dim]")
+        cprint(f"  ntfy topic : [cyan]{cfg.get('ntfy_topic', '—')}[/cyan]")
+        cprint(f"  最大重试次数: {cfg.get('max_retries', 3)}")
+        cprint(f"  验证码等待 : {cfg.get('otp_wait_secs', 120)} 秒")
+        creds = _load_saved_creds()
+        if creds.get("username"):
+            cprint(f"  keyring 账号: [dim]{creds['username']} @ {creds['domain']}[/dim]")
+        return
+
+    # Not yet enabled: full setup flow
     creds = _load_saved_creds()
     if not (creds.get("domain") and creds.get("username") and creds.get("password")):
         cprint("[yellow]keyring 中无账号密码，请输入：[/yellow]")
@@ -3934,10 +3962,8 @@ def cmd_autologin(args):
         cprint(f"[green]✓ 使用 keyring 账号：{creds['username']} @ {creds['domain']}[/green]")
 
     # 生成或复用 ntfy_topic
-    cfg = _load_auto_login_cfg()
     existing_topic = cfg.get("ntfy_topic", "")
     if getattr(args, "reset_topic", False) or not existing_topic:
-        # 16 hex chars = 64 bit 熵，与其他用户碰撞概率极低
         ntfy_topic = "macli-" + _secrets.token_hex(8)
         dprint(f"[dim]生成新 ntfy topic: {ntfy_topic}[/dim]")
     else:
