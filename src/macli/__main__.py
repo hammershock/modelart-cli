@@ -2268,7 +2268,7 @@ def _server_run(args):
             devs      = r.get("gpu_devices", [])
             job_id    = r.get("job_id") or "?"
             job_short = job_id[:8]
-            flag      = "🏠" if job_id in stable_ids else "⚠️"
+            flag      = "🏠" if job_id in stable_ids else "🔴"
             ssh       = r.get("ssh_port") or "—"
             cpu       = _fmt_pct(r.get("cpu"))
             mem       = _fmt_mem(r.get("mem"))
