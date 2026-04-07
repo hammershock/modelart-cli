@@ -1376,20 +1376,22 @@ def _setup_session_from_cookie(ck: str, interactive: bool) -> None:
     dprint("[cyan]验证 cookie 并获取账号信息...[/cyan]")
     me = _me_probe(http, cftk)
     support_regions = me.get("supportRegions", [])
-    if not support_regions:
-        cprint("[red]无法获取账号信息，请确认 cookie 有效[/red]")
-        sys.exit(1)
 
-    if interactive:
-        # 交互式选择 region
-        regions = sorted(r for r in support_regions if r in REGION_NAMES)
+    if interactive or not support_regions:
+        # 交互式选择 region（或 _me 探测失败时的兜底手动选择）
+        if not support_regions:
+            cprint("[yellow]无法自动获取账号区域信息，请手动选择[/yellow]")
+        known_regions = sorted(REGION_NAMES.keys())
+        regions = sorted(r for r in support_regions if r in REGION_NAMES) or known_regions
         cprint("\n[bold]可用区域：[/bold]")
         for i, r in enumerate(regions, 1):
-            cprint(f"  [cyan]{i}.[/cyan] {r}  [dim]{REGION_NAMES[r]}[/dim]")
+            cprint(f"  [cyan]{i:2d}.[/cyan] {r}  [dim]{REGION_NAMES.get(r,'')}[/dim]")
         while True:
-            choice = input(f"\n请选择区域 (1-{len(regions)}): ").strip()
+            choice = input(f"\n请选择区域 (1-{len(regions)}) 或直接输入区域名: ").strip()
             if choice.isdigit() and 1 <= int(choice) <= len(regions):
                 region = regions[int(choice) - 1]; break
+            if choice in REGION_NAMES:
+                region = choice; break
             cprint("[red]输入无效，请重试[/red]")
     else:
         # 默认取 me 返回的当前 region
@@ -1398,11 +1400,15 @@ def _setup_session_from_cookie(ck: str, interactive: bool) -> None:
 
     # 获取该 region 的 project_id
     dprint(f"[cyan]获取 {region} 的 project_id...[/cyan]")
-    me2       = _me(http, region, cftk)
+    me2        = _me(http, region, cftk)
     project_id = me2.get("projectId", "")
     agency_id  = me2.get("id") or me2.get("userId", "")
     if not project_id:
-        cprint(f"[red]无法获取 {region} 的 project_id[/red]"); sys.exit(1)
+        cprint(f"[yellow]无法自动获取 {region} 的 project_id[/yellow]")
+        cprint("[dim]可在控制台 → IAM → 项目 中查看，或访问 console.huaweicloud.com/iam[/dim]")
+        project_id = input("请输入 project_id: ").strip()
+        if not project_id:
+            cprint("[red]project_id 不能为空[/red]"); sys.exit(1)
     dprint(f"[green]✓ region={region}  project_id={project_id}[/green]")
 
     sess = ConsoleSession()
