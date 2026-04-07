@@ -1053,8 +1053,26 @@ def _me(http, region, cftk, agency_id="") -> dict:
                                 f"&agencyId={agency_id}&region={region}",
         },
         timeout=15)
-    if r.status_code == 200:
-        return r.json()
+    if r.status_code == 200 and r.text.strip():
+        try:
+            return r.json()
+        except Exception:
+            return {}
+    return {}
+
+
+_ME_PROBE_REGIONS = [
+    "cn-north-4", "cn-north-9", "cn-east-3", "cn-south-1",
+    "cn-east-4", "cn-southwest-2", "ap-southeast-3",
+]
+
+
+def _me_probe(http, cftk) -> dict:
+    """尝试多个常见 region，返回第一个包含 supportRegions 的 me 响应。"""
+    for region in _ME_PROBE_REGIONS:
+        me = _me(http, region, cftk)
+        if me.get("supportRegions"):
+            return me
     return {}
 
 
@@ -1354,9 +1372,9 @@ def _setup_session_from_cookie(ck: str, interactive: bool) -> None:
         k, _, v = part.strip().partition("=")
         if k: http.cookies.set(k.strip(), v.strip())
 
-    # 拿 me 信息（用 cn-north-9 作为初始 region）
+    # 拿 me 信息（自动探测可用 region）
     dprint("[cyan]验证 cookie 并获取账号信息...[/cyan]")
-    me = _me(http, "cn-north-9", cftk)
+    me = _me_probe(http, cftk)
     support_regions = me.get("supportRegions", [])
     if not support_regions:
         cprint("[red]无法获取账号信息，请确认 cookie 有效[/red]")
