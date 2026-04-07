@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "modelarts-macli"
-version = "0.1.0"
+version = "0.1.1"
 description = "华为云 ModelArts 远程管理 CLI"
 license = "MIT"
 authors = [{ name = "hammershock" }]

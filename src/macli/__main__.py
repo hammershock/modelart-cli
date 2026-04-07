@@ -254,43 +254,64 @@ def _parse_ssh_url(url: str):
 
 # ── 凭据安全存储（系统 Keychain）────────────────────────────────
 
+_CREDS_FILE = _config_path().parent / "credentials.json"
+
+
 def _load_saved_creds() -> dict:
-    """从系统 Keychain 读取已保存的账号密码，返回 {"domain", "username", "password"} 或 {}"""
-    if not _KEYRING_OK:
-        return {}
+    """从 Keychain 或备用文件读取已保存的账号密码"""
+    if _KEYRING_OK:
+        try:
+            raw = _keyring.get_password(_KR_SERVICE, _KR_KEY)
+            if raw:
+                return json.loads(raw)
+        except Exception:
+            pass
+    # 回退：明文文件
     try:
-        raw = _keyring.get_password(_KR_SERVICE, _KR_KEY)
-        if raw:
-            return json.loads(raw)
+        if _CREDS_FILE.exists():
+            return json.loads(_CREDS_FILE.read_text(encoding="utf-8"))
     except Exception:
         pass
     return {}
 
 
 def _save_creds(domain: str, username: str, password: str) -> bool:
-    """将账号密码加密存入系统 Keychain，成功返回 True"""
-    if not _KEYRING_OK:
-        return False
+    """将账号密码存入 Keychain（优先）或备用明文文件"""
+    payload = json.dumps({"domain": domain, "username": username, "password": password},
+                         ensure_ascii=False)
+    if _KEYRING_OK:
+        try:
+            _keyring.set_password(_KR_SERVICE, _KR_KEY, payload)
+            return True
+        except Exception:
+            pass
+    # 回退：明文文件（权限 600）
     try:
-        _keyring.set_password(
-            _KR_SERVICE, _KR_KEY,
-            json.dumps({"domain": domain, "username": username, "password": password},
-                       ensure_ascii=False)
-        )
+        _CREDS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _CREDS_FILE.write_text(payload, encoding="utf-8")
+        _CREDS_FILE.chmod(0o600)
+        dprint("[dim]密码已存入文件（keyring 不可用）[/dim]")
         return True
     except Exception:
         return False
 
 
 def _clear_saved_creds() -> bool:
-    """从系统 Keychain 删除已保存的账号密码，成功返回 True"""
-    if not _KEYRING_OK:
-        return False
-    try:
-        _keyring.delete_password(_KR_SERVICE, _KR_KEY)
-        return True
-    except Exception:
-        return False
+    """删除已保存的账号密码"""
+    ok = False
+    if _KEYRING_OK:
+        try:
+            _keyring.delete_password(_KR_SERVICE, _KR_KEY)
+            ok = True
+        except Exception:
+            pass
+    if _CREDS_FILE.exists():
+        try:
+            _CREDS_FILE.unlink()
+            ok = True
+        except Exception:
+            pass
+    return ok
 
 
 # ── 自动登录 ──────────────────────────────────────────────────
@@ -397,12 +418,12 @@ def _do_auto_login(cfg: dict) -> bool:
                 dprint(f"[dim]ntfy 收到验证码: {code}[/dim]")
             return code
 
-        ck = _http_login(
+        ck, http_s = _http_login(
             creds["domain"], creds["username"], creds["password"],
             otp_provider=_otp_provider,
         )
         if ck:
-            _setup_session_from_cookie(ck, interactive=False)
+            _setup_session_from_cookie(ck, interactive=False, http_session=http_s)
             cprint("[bold green]✓ 自动重新登录成功[/bold green]")
             return True
         cprint(f"[yellow]第 {attempt} 次尝试失败[/yellow]")
@@ -1116,10 +1137,10 @@ def _select_workspace(sess) -> str:
 
 def _http_login(domain: str, username: str, password: str,
                 service: str = "https://console.huaweicloud.com/console/",
-                otp_provider=None) -> str:
+                otp_provider=None):
     """
-    纯 HTTP 登录华为云（IAM 用户 + 短信 MFA），返回 cookie 字符串。
-    失败返回空字符串。
+    纯 HTTP 登录华为云（IAM 用户 + 短信 MFA），返回 (cookie_str, session)。
+    失败返回 ("", None)。
     """
     import urllib.parse, json as _json
 
@@ -1178,10 +1199,10 @@ def _http_login(domain: str, username: str, password: str,
         data = r.json()
     except Exception:
         cprint(f"[red]密码登录响应解析失败: {r.text[:200]}[/red]")
-        return ""
+        return "", None
     if data.get("loginResult") != "success":
         cprint(f"[red]密码登录失败: {data.get('loginResult')} — {data.get('loginMessage','')}[/red]")
-        return ""
+        return "", None
     dprint("[dim]密码验证通过[/dim]")
 
     # Step 4: 获取 MFA 信息（含 IAMCSRF）
@@ -1196,10 +1217,10 @@ def _http_login(domain: str, username: str, password: str,
         anti = r.json()
     except Exception:
         cprint(f"[red]MFA 信息获取失败: {r.text[:200]}[/red]")
-        return ""
+        return "", None
     if anti.get("result") != "success":
         cprint(f"[red]MFA 信息获取失败: {anti}[/red]")
-        return ""
+        return "", None
     iamcsrf = anti.get("IAMCSRF", "")
     dprint(f"[dim]MFA 响应字段: {list(anti.keys())}[/dim]")
 
@@ -1245,7 +1266,7 @@ def _http_login(domain: str, username: str, password: str,
         sms_code = input("\n请输入收到的 6 位验证码: ").strip()
     if not sms_code:
         cprint("[red]验证码不能为空[/red]")
-        return ""
+        return "", None
 
     dprint("[dim][6] 提交验证码...[/dim]")
     r = s.post(
@@ -1258,11 +1279,11 @@ def _http_login(domain: str, username: str, password: str,
     )
     if not r.is_redirect:
         cprint(f"[red]验证码提交后未跳转 (HTTP {r.status_code}): {r.text[:200]}[/red]")
-        return ""
+        return "", None
     location = r.headers.get("location", "")
     if "actionErrors=419" in location:
         cprint("[red]验证码无效或已失效（419），请重试[/red]")
-        return ""
+        return "", None
 
     next_url = urllib.parse.urljoin(r.url, location)
     dprint(f"[dim][7] 跟随跳转: {next_url[:80]}...[/dim]")
@@ -1289,10 +1310,10 @@ def _http_login(domain: str, username: str, password: str,
 
     if not ck:
         cprint("[yellow]未获取到任何 cookie[/yellow]")
-        return ""
+        return "", None
 
     dprint(f"[dim]获取到 {len(all_cookies)} 个 cookie，共 {len(ck)} 字符[/dim]")
-    return ck
+    return ck, s
 
 
 def _extract_cftk(cookie_str: str) -> str:
@@ -1304,29 +1325,30 @@ def _extract_cftk(cookie_str: str) -> str:
     return ""
 
 
-def _get_cookie_from_args_or_input(args) -> str:
-    """按优先级获取 cookie：--cookie 参数 > session 缓存 > Keychain 自动登录 > 交互登录"""
+def _get_cookie_from_args_or_input(args):
+    """按优先级获取 cookie：--cookie 参数 > session 缓存 > 已保存凭据 > 交互登录
+    返回 (cookie_str, http_session_or_none)"""
     # 1. --cookie 参数直接给了
     if getattr(args, "cookie", None):
         ck = args.cookie.strip()
         dprint(f"[green]✓ 使用 --cookie 参数（{len(ck)} 字符）[/green]")
-        return ck
+        return ck, None
 
     # 2. 从已保存的 session 中读取 cookie
     d = load_session()
     ck = d.get("cookie_str", "")
     if ck:
         dprint(f"[green]✓ 从 session 读取 cookie（{len(ck)} 字符）[/green]")
-        return ck
+        return ck, None
 
-    # 3. 从系统 Keychain 读取已保存的账号密码，自动登录
+    # 3. 从已保存的账号密码自动登录
     saved = _load_saved_creds()
     if saved.get("domain") and saved.get("username") and saved.get("password"):
         cprint(f"[cyan]使用已保存的账号自动登录：[bold]{saved['username']}[/bold] @ {saved['domain']}[/cyan]")
-        ck = _http_login(saved["domain"], saved["username"], saved["password"])
+        ck, http_s = _http_login(saved["domain"], saved["username"], saved["password"])
         if ck:
-            dprint("[green]✓ Keychain 自动登录成功[/green]")
-            return ck
+            dprint("[green]✓ 自动登录成功[/green]")
+            return ck, http_s
         cprint("[yellow]已保存的账号登录失败（密码可能已变更），请重新输入[/yellow]")
         _clear_saved_creds()
 
@@ -1339,43 +1361,41 @@ def _get_cookie_from_args_or_input(args) -> str:
 
     if not all([_domain, _username, _password]):
         cprint("[red]账号信息不完整[/red]")
-        return ""
+        return "", None
 
-    ck = _http_login(_domain, _username, _password)
+    ck, http_s = _http_login(_domain, _username, _password)
     if not ck:
-        return ""
+        return "", None
 
-    # 登录成功后询问是否保存账号密码到系统 Keychain
-    if _KEYRING_OK:
-        try:
-            save_it = input("记住账号密码，下次自动登录？[y/N] ").strip().lower()
-        except EOFError:
-            save_it = "n"
-        if save_it == "y":
-            if _save_creds(_domain, _username, _password):
-                cprint("[green]✓ 账号密码已安全保存至系统 Keychain[/green]")
-            else:
-                cprint("[yellow]保存失败，本次密码不会被记住[/yellow]")
+    if _save_creds(_domain, _username, _password):
+        cprint("[green]✓ 账号密码已安全保存，下次自动登录[/green]")
     else:
-        dprint("[dim]keyring 不可用，跳过密码保存[/dim]")
+        dprint("[dim]密码未保存（keyring 不可用）[/dim]")
 
-    return ck
+    return ck, http_s
 
 
-def _setup_session_from_cookie(ck: str, interactive: bool) -> None:
-    """用 cookie 初始化 session，interactive=True 时交互选择 region/workspace"""
+def _setup_session_from_cookie(ck: str, interactive: bool, http_session=None) -> None:
+    """用 cookie 初始化 session，interactive=True 时交互选择 region/workspace。
+    http_session: 来自 _http_login 的原始 session，有完整的 console 上下文；
+                  为 None 时从 cookie 字符串重建（适用于 --cookie 粘贴路径）。
+    """
     cftk = _extract_cftk(ck)
     dprint("[green]✓ 从 cookie 中提取 cftk[/green]")
 
     # 先保存 cookie，登录凭证不依赖后续探测
     d = load_session(); d["cookie_str"] = ck; save_session(d)
 
-    http = _new_session()
-    for part in ck.split(";"):
-        k, _, v = part.strip().partition("=")
-        if k: http.cookies.set(k.strip(), v.strip())
+    # 复用登录 session（有 console 上下文），或从 cookie 字符串重建
+    if http_session is not None:
+        http = http_session
+    else:
+        http = _new_session()
+        for part in ck.split(";"):
+            k, _, v = part.strip().partition("=")
+            if k: http.cookies.set(k.strip(), v.strip())
 
-    # 探测 region/project_id（仅优化体验，失败不阻断登录）
+    # 探测 region/project_id
     dprint("[cyan]获取账号区域信息...[/cyan]")
     me = _me_probe(http, cftk)
     support_regions = me.get("supportRegions", [])
@@ -1447,15 +1467,15 @@ def _manual_cookie_input() -> str:
 
 
 def cmd_login(args):
-    ck = _get_cookie_from_args_or_input(args)
+    ck, http_session = _get_cookie_from_args_or_input(args)
 
     # 登录失败时，只有 --cookie 路径才继续
     if not ck:
         if not getattr(args, "cookie", None):
-            # 没传 --cookie，登录失败，直接退出
             sys.exit(1)
         # --cookie 传了但为空，展示指南让用户粘贴
         ck = _manual_cookie_input()
+        http_session = None
         if not ck:
             sys.exit(1)
 
@@ -1463,13 +1483,15 @@ def cmd_login(args):
     if not _extract_cftk(ck):
         cprint("[red]cookie 无效（无法提取 cftk），请重新获取[/red]")
         ck = _manual_cookie_input()
+        http_session = None
         if not ck:
             sys.exit(1)
         if not _extract_cftk(ck):
             cprint("[red]cookie 仍然无效，退出[/red]")
             sys.exit(1)
 
-    _setup_session_from_cookie(ck, interactive=getattr(args, "interactive", False))
+    _setup_session_from_cookie(ck, interactive=getattr(args, "interactive", False),
+                               http_session=http_session)
     cprint(f"\n[green]✓ 登录成功！[/green]")
 
 
