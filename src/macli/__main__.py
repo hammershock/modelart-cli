@@ -3877,9 +3877,22 @@ def cmd_autologin(args):
 
     action = getattr(args, "action", None) or "status"
 
-    # ── status ────────────────────────────────────────────────
+    # ── status (with optional inline config update) ───────────
     if action == "status":
         cfg = _load_auto_login_cfg()
+        changed = False
+        if getattr(args, "retries", None) is not None:
+            cfg["max_retries"] = args.retries
+            changed = True
+        if getattr(args, "timeout", None) is not None:
+            cfg["otp_wait_secs"] = args.timeout
+            changed = True
+        if getattr(args, "reset_topic", False):
+            cfg["ntfy_topic"] = "macli-" + _secrets.token_hex(8)
+            changed = True
+        if changed:
+            _save_auto_login_cfg(cfg)
+            cprint("[green]✓ 配置已更新[/green]")
         if not cfg.get("enabled"):
             cprint("[yellow]自动登录：[bold]未启用[/bold][/yellow]")
         else:
