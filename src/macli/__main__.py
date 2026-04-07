@@ -1367,34 +1367,37 @@ def _setup_session_from_cookie(ck: str, interactive: bool) -> None:
     cftk = _extract_cftk(ck)
     dprint("[green]✓ 从 cookie 中提取 cftk[/green]")
 
+    # 先保存 cookie，登录凭证不依赖后续探测
+    d = load_session(); d["cookie_str"] = ck; save_session(d)
+
     http = _new_session()
     for part in ck.split(";"):
         k, _, v = part.strip().partition("=")
         if k: http.cookies.set(k.strip(), v.strip())
 
-    # 拿 me 信息（自动探测可用 region）
-    dprint("[cyan]验证 cookie 并获取账号信息...[/cyan]")
+    # 探测 region/project_id（仅优化体验，失败不阻断登录）
+    dprint("[cyan]获取账号区域信息...[/cyan]")
     me = _me_probe(http, cftk)
     support_regions = me.get("supportRegions", [])
 
-    if interactive or not support_regions:
-        # 交互式选择 region（或 _me 探测失败时的兜底手动选择）
-        if not support_regions:
-            cprint("[yellow]无法自动获取账号区域信息，请手动选择[/yellow]")
-        known_regions = sorted(REGION_NAMES.keys())
-        regions = sorted(r for r in support_regions if r in REGION_NAMES) or known_regions
+    if not support_regions:
+        # _me 探测失败：cookie 已保存，提示后续手动配置区域
+        cprint("[yellow]无法自动获取区域信息，请登录后执行：[/yellow]")
+        cprint("[dim]  macli region select    # 配置区域[/dim]")
+        cprint("[dim]  macli workspace select  # 配置工作空间[/dim]")
+        return
+
+    if interactive:
+        regions = sorted(r for r in support_regions if r in REGION_NAMES)
         cprint("\n[bold]可用区域：[/bold]")
         for i, r in enumerate(regions, 1):
-            cprint(f"  [cyan]{i:2d}.[/cyan] {r}  [dim]{REGION_NAMES.get(r,'')}[/dim]")
+            cprint(f"  [cyan]{i}.[/cyan] {r}  [dim]{REGION_NAMES[r]}[/dim]")
         while True:
-            choice = input(f"\n请选择区域 (1-{len(regions)}) 或直接输入区域名: ").strip()
+            choice = input(f"\n请选择区域 (1-{len(regions)}): ").strip()
             if choice.isdigit() and 1 <= int(choice) <= len(regions):
                 region = regions[int(choice) - 1]; break
-            if choice in REGION_NAMES:
-                region = choice; break
             cprint("[red]输入无效，请重试[/red]")
     else:
-        # 默认取 me 返回的当前 region
         region = me.get("region", "cn-north-9")
         dprint(f"[cyan]使用默认区域: {region}  {REGION_NAMES.get(region,'')}[/cyan]")
 
@@ -1404,24 +1407,17 @@ def _setup_session_from_cookie(ck: str, interactive: bool) -> None:
     project_id = me2.get("projectId", "")
     agency_id  = me2.get("id") or me2.get("userId", "")
     if not project_id:
-        cprint(f"[yellow]无法自动获取 {region} 的 project_id[/yellow]")
-        cprint("[dim]可在控制台 → IAM → 项目 中查看，或访问 console.huaweicloud.com/iam[/dim]")
-        project_id = input("请输入 project_id: ").strip()
-        if not project_id:
-            cprint("[red]project_id 不能为空[/red]"); sys.exit(1)
+        cprint(f"[red]无法获取 {region} 的 project_id[/red]"); sys.exit(1)
     dprint(f"[green]✓ region={region}  project_id={project_id}[/green]")
 
     sess = ConsoleSession()
     sess.init(ck, region, project_id, agency_id, cftk, "")
-    # 同时把原始 cookie 字符串存入 session，供下次 login 复用
-    d = load_session(); d["cookie_str"] = ck; save_session(d)
 
     if interactive:
         wsid = _select_workspace(sess)
         sess.workspace_id = wsid
         d = load_session(); d["workspace_id"] = wsid; save_session(d)
     else:
-        # 非交互模式：自动选第一个工作空间作为默认
         dprint("[cyan]获取工作空间列表...[/cyan]")
         workspaces = _fetch_workspaces(sess)
         if workspaces:
@@ -1475,8 +1471,6 @@ def cmd_login(args):
 
     _setup_session_from_cookie(ck, interactive=getattr(args, "interactive", False))
     cprint(f"\n[green]✓ 登录成功！[/green]")
-    if not getattr(args, "interactive", False):
-        dprint("[dim]提示：使用 region select / workspace select 配置区域和工作空间[/dim]")
 
 
 def cmd_workspace_list(args):
