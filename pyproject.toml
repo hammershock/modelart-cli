@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "modelarts-macli"
-version = "0.1.1"
+version = "0.1.2"
 description = "华为云 ModelArts 远程管理 CLI"
 license = "MIT"
 authors = [{ name = "hammershock" }]
@@ -12,8 +12,10 @@ requires-python = ">=3.8"
 dependencies = [
     "requests",
     "rich",
-    "keyring",
 ]
+
+[project.optional-dependencies]
+keyring = ["keyring"]
 
 [project.urls]
 Homepage = "https://github.com/hammershock/modelart-cli"
