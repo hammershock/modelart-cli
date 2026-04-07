@@ -1970,7 +1970,7 @@ def _server_run(args):
                 return self.result, round(time.monotonic() - self.last_run, 1)
 
     _ports_cache  = _CachedCall(ttl=30.0)
-    _health_cache = _CachedCall(ttl=60.0)
+    _health_cache = _CachedCall(ttl=3.0)
     _srv_log: list = []
     _srv_log_lock  = _threading.Lock()
 
@@ -2116,27 +2116,75 @@ def _server_run(args):
 
     @app.get("/health")
     def health():
-        def _fetch_login():
-            r = _subprocess.run(
-                [sys.executable, "-m", "macli", "whoami", "--json"],
-                capture_output=True, text=True, timeout=20,
-            )
-            if r.returncode == 0:
-                try:
-                    d = json.loads(r.stdout)
-                    return {"logged_in": True,
-                            "user": d.get("user"),
-                            "session_age_hours": d.get("session_age_hours")}
-                except (json.JSONDecodeError, KeyError):
-                    pass
-            return {"logged_in": False}
+        def _fetch():
+            sess = load_session()
+            ck   = sess.get("cookies", {})
 
-        login, _ = _health_cache.get(_fetch_login)
+            # ── login ─────────────────────────────────────────
+            saved_at  = sess.get("saved_at", 0)
+            age_h     = round((time.time() - saved_at) / 3600, 1) if saved_at else None
+            login = {
+                "logged_in":         bool(ck and sess.get("project_id")),
+                "user":              ck.get("masked_user", ""),
+                "domain":            ck.get("masked_domain", ""),
+                "session_age_hours": age_h,
+            }
+
+            # ── server ────────────────────────────────────────
+            srv = sess.get(_SERVER_KEY, {})
+            server = {
+                "enabled": srv.get("enabled", False),
+                "launchd": _server_launchctl_is_loaded(),
+                "port":    srv.get("port", 8086),
+            }
+
+            # ── watch ─────────────────────────────────────────
+            wch = sess.get(_WATCH_KEY, {})
+            last_check = None
+            try:
+                if _WATCH_STATE_FILE.exists():
+                    ws = json.loads(_WATCH_STATE_FILE.read_text(encoding="utf-8"))
+                    last_check = ws.get("last_check")
+            except Exception:
+                pass
+            watch = {
+                "enabled":         wch.get("enabled", False),
+                "launchd":         _launchctl_is_loaded(),
+                "interval_h":      wch.get("interval_h"),
+                "threshold_hours": wch.get("threshold_hours"),
+                "last_check":      last_check,
+            }
+
+            # ── autologin ─────────────────────────────────────
+            al = sess.get(_AUTOLOGIN_KEY, {})
+            autologin = {
+                "enabled":              al.get("enabled", False),
+                "circuit_tripped":      al.get("circuit_tripped", False),
+                "consecutive_failures": al.get("consecutive_failures", 0),
+                "circuit_breaker":      al.get("circuit_breaker", 3),
+            }
+
+            # ── exec / identityfiles ──────────────────────────
+            idf_map, idf_default = load_identityfiles()
+            exec_info = {
+                "backend":             sess.get("exec_backend", "cloudshell"),
+                "identityfiles":       idf_map,
+                "default_identityfile": idf_default,
+            }
+
+            return {
+                "login":    login,
+                "server":   server,
+                "watch":    watch,
+                "autologin": autologin,
+                "exec":     exec_info,
+            }
+
+        data, _ = _health_cache.get(_fetch)
         with _cache_lock:
             last = _cache["last_run"]
         gpu_age = round(time.monotonic() - last, 1) if last > 0 else None
-        return {"status": "ok", "port": port,
-                "gpu_cache_age_s": gpu_age, **login}
+        return {"status": "ok", "port": port, "gpu_cache_age_s": gpu_age, **data}
 
     @app.get("/watch-log", response_class=_Plain)
     def get_watch_log():
