@@ -1824,13 +1824,16 @@ def _watch_enable(args):
     interval_h      = getattr(args, "interval",        1)
     threshold_hours = getattr(args, "threshold_hours", 72)
 
-    # 找脚本路径：参数 > 已保存配置
+    # 找脚本路径：参数 > 已保存配置 > 包内默认路径
+    _bundled = Path(__file__).resolve().parents[2] / "scripts" / "check_jobs.py"
     if script_arg:
         script_path = Path(script_arg).expanduser().resolve()
     else:
         stored = _load_watch_cfg().get("script_path", "")
         if stored and Path(stored).exists():
             script_path = Path(stored)
+        elif _bundled.exists():
+            script_path = _bundled
         else:
             cprint("[red]请用 --script 指定 check_jobs.py 的路径[/red]")
             cprint("[dim]示例：macli watch enable --script /path/to/scripts/check_jobs.py[/dim]")
