@@ -1818,6 +1818,315 @@ def _watch_run(args):
     sys.exit(result.returncode)
 
 
+# ── macli server ─────────────────────────────────────────────
+_SERVER_KEY         = "server"
+_SERVER_PLIST_LABEL = "com.macli.server"
+_SERVER_PLIST_PATH  = Path.home() / "Library" / "LaunchAgents" / f"{_SERVER_PLIST_LABEL}.plist"
+_SERVER_LOG_FILE    = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "macli" / "server.log"
+_MACLI_LOG_FILE     = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "macli" / "macli.log"
+
+
+def _load_server_cfg() -> dict:
+    return load_session().get(_SERVER_KEY, {})
+
+def _save_server_cfg(cfg: dict):
+    data = load_session()
+    data[_SERVER_KEY] = cfg
+    save_session(data)
+
+def _server_plist_xml(port: int) -> str:
+    log = str(_SERVER_LOG_FILE)
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"'
+        ' "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0">\n<dict>\n'
+        f'    <key>Label</key>\n    <string>{_SERVER_PLIST_LABEL}</string>\n'
+        '    <key>ProgramArguments</key>\n    <array>\n'
+        f'        <string>{sys.executable}</string>\n'
+        '        <string>-m</string>\n        <string>macli</string>\n'
+        '        <string>server</string>\n        <string>run</string>\n'
+        f'        <string>--port</string>\n        <string>{port}</string>\n'
+        '    </array>\n'
+        '    <key>RunAtLoad</key>\n    <true/>\n'
+        '    <key>KeepAlive</key>\n    <true/>\n'
+        f'    <key>StandardOutPath</key>\n    <string>{log}</string>\n'
+        f'    <key>StandardErrorPath</key>\n    <string>{log}</string>\n'
+        '</dict>\n</plist>\n'
+    )
+
+def _server_launchctl(action: str) -> bool:
+    r = _subprocess.run(
+        ["launchctl", action, "-w", str(_SERVER_PLIST_PATH)],
+        capture_output=True, text=True,
+    )
+    return r.returncode == 0
+
+def _server_launchctl_is_loaded() -> bool:
+    r = _subprocess.run(
+        ["launchctl", "list", _SERVER_PLIST_LABEL],
+        capture_output=True, text=True,
+    )
+    return r.returncode == 0
+
+def cmd_server(args):
+    action = getattr(args, "server_action", None) or "status"
+    if action == "enable":
+        _server_enable(args)
+    elif action == "disable":
+        _server_disable()
+    elif action == "run":
+        _server_run(args)
+    else:
+        _server_status()
+
+def _server_status():
+    cfg    = _load_server_cfg()
+    loaded = _server_launchctl_is_loaded()
+    port   = cfg.get("port", 8086)
+    if cfg.get("enabled") and loaded:
+        cprint("[green]server：已启用（launchd 运行中）[/green]")
+    elif cfg.get("enabled"):
+        cprint("[yellow]server：已配置但 launchd 未运行（执行 macli server enable 重新加载）[/yellow]")
+    else:
+        cprint("[dim]server：未启用[/dim]")
+    if cfg:
+        cprint(f"  端口        : {port}")
+        cprint(f"  /gpu        : http://localhost:{port}/gpu")
+        cprint(f"  /log        : http://localhost:{port}/log")
+        cprint(f"  /server-log : http://localhost:{port}/server-log")
+        cprint(f"  日志文件    : [dim]{_SERVER_LOG_FILE}[/dim]")
+
+def _server_enable(args):
+    port = getattr(args, "port", None) or _load_server_cfg().get("port", 8086)
+    _SERVER_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _SERVER_PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _server_launchctl("unload")
+    _SERVER_PLIST_PATH.write_text(_server_plist_xml(port), encoding="utf-8")
+    ok = _server_launchctl("load")
+    cfg = _load_server_cfg()
+    cfg.update({"enabled": True, "port": port})
+    _save_server_cfg(cfg)
+    if ok:
+        cprint(f"[green]✓ server 已启用  http://localhost:{port}/gpu[/green]")
+    else:
+        cprint(f"[yellow]⚠ 配置已写入，launchctl load 返回非零（可能已在运行）[/yellow]")
+        cprint(f"  http://localhost:{port}/gpu")
+
+def _server_disable():
+    _server_launchctl("unload")
+    if _SERVER_PLIST_PATH.exists():
+        _SERVER_PLIST_PATH.unlink()
+    cfg = _load_server_cfg()
+    cfg["enabled"] = False
+    _save_server_cfg(cfg)
+    cprint("[green]✓ server 已停用[/green]")
+
+def _server_run(args):
+    """在当前进程内启动 FastAPI server（阻塞）。由 launchd 或手动调用。"""
+    import threading as _threading
+    from io import StringIO as _StringIO
+
+    port = getattr(args, "port", None) or _load_server_cfg().get("port", 8086)
+
+    try:
+        import fastapi as _fastapi
+        import uvicorn as _uvicorn
+    except ImportError:
+        _subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet", "fastapi", "uvicorn[standard]"]
+        )
+        import fastapi as _fastapi
+        import uvicorn as _uvicorn
+
+    from fastapi import FastAPI as _FastAPI, Request as _Request
+    from fastapi.responses import PlainTextResponse as _Plain, JSONResponse as _JSON
+    from rich.console import Console as _RConsole
+    from rich.table import Table as _RTable
+
+    _RATE_LIMIT = 10.0
+    _cache_lock = _threading.Lock()
+    _cache      = {"last_run": 0.0, "ansi": "", "plain": ""}
+    _srv_log: list = []
+    _srv_log_lock  = _threading.Lock()
+
+    # ── 浏览器检测 ─────────────────────────────────────────
+    def _is_browser(req: _Request) -> bool:
+        ua     = (req.headers.get("user-agent") or "").lower()
+        accept = (req.headers.get("accept")     or "").lower()
+        if any(x in ua for x in ("curl/", "wget/", "httpie/", "python-requests",
+                                  "go-http-client", "postmanruntime/")):
+            return False
+        if any(x in ua for x in ("mozilla/", "chrome/", "safari/", "firefox/", "edg/")):
+            return True
+        return "text/html" in accept and "text/plain" not in accept
+
+    # ── 请求日志 ────────────────────────────────────────────
+    def _log_req(method: str, path: str, status: int, ms: float):
+        ts   = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        line = f"{ts} {method} {path} {status} {ms:.0f}ms"
+        with _srv_log_lock:
+            _srv_log.append(line)
+            if len(_srv_log) > 10000:
+                del _srv_log[:-10000]
+        try:
+            _SERVER_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(_SERVER_LOG_FILE, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        except OSError:
+            pass
+
+    # ── 渲染 macli usage --probe --json → 表格 ─────────────
+    def _pct(v):  return f"{round((v or 0) * 100)}%" if v is not None else "—"
+    def _mbs(v):  return f"{round(v or 0)}"           if v is not None else "—"
+
+    def _render_jobs(jobs: list, use_ansi: bool) -> str:
+        if not jobs:
+            return "No running jobs.\n"
+        buf = _StringIO()
+        con = _RConsole(file=buf, force_terminal=use_ansi, force_jupyter=False,
+                        highlight=False, markup=False, width=130,
+                        color_system="truecolor" if use_ansi else None)
+        tbl = _RTable(show_header=True,
+                      header_style="bold cyan" if use_ansi else "",
+                      show_lines=False, pad_edge=False)
+        for col, kw in [("name",   dict(min_width=20, no_wrap=True)),
+                        ("ssh",    dict(width=7,      no_wrap=True)),
+                        ("cpu%",   dict(width=5,      no_wrap=True)),
+                        ("mem MB", dict(width=8,      no_wrap=True)),
+                        ("gpu%",   dict(width=5,      no_wrap=True)),
+                        ("gpu MB", dict(width=8,      no_wrap=True)),
+                        ("devices",dict(min_width=30, no_wrap=False))]:
+            tbl.add_column(col, **kw)
+        for r in jobs:
+            devs    = r.get("gpu_devices", [])
+            dev_str = " | ".join(
+                f"gpu{d.get('index','?')} {_pct(d.get('util'))} "
+                f"{_mbs(d.get('vram_used_mb'))}/{_mbs(d.get('vram_total_mb'))}MB"
+                for d in devs
+            ) or "—"
+            tbl.add_row(
+                r.get("name") or r.get("job_id", "?")[:8],
+                r.get("ssh_port") or "—",
+                _pct(r.get("cpu")), _mbs(r.get("mem")),
+                _pct(r.get("gpu")), _mbs(r.get("gpu_mem")),
+                dev_str,
+            )
+        con.print(tbl)
+        return buf.getvalue()
+
+    def _refresh():
+        result = _subprocess.run(
+            [sys.executable, "-m", "macli", "usage", "--probe", "--json"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode == 0:
+            try:
+                data = json.loads(result.stdout)
+                jobs = data.get("jobs", [])
+                ansi  = _render_jobs(jobs, True)
+                plain = _render_jobs(jobs, False)
+            except (json.JSONDecodeError, KeyError) as e:
+                ansi = plain = f"parse error: {e}\n{result.stdout[:300]}\n"
+        else:
+            err  = (result.stdout or result.stderr or "").strip()[:400]
+            ansi = plain = f"Error (exit {result.returncode}):\n{err}\n"
+        with _cache_lock:
+            _cache["ansi"]    = ansi
+            _cache["plain"]   = plain
+            _cache["last_run"] = time.monotonic()
+
+    # ── tail 工具 ───────────────────────────────────────────
+    def _tail(path: Path, n: int) -> str:
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            return "\n".join(lines[-n:]) + "\n"
+        except FileNotFoundError:
+            return "(log file not found)\n"
+        except OSError as e:
+            return f"(error: {e})\n"
+
+    # ── App ─────────────────────────────────────────────────
+    app = _FastAPI(title="macli server")
+
+    @app.middleware("http")
+    async def _access_log(req: _Request, call_next):
+        t0 = time.monotonic()
+        try:
+            resp   = await call_next(req)
+            status = resp.status_code
+        except Exception:
+            status = 500
+            raise
+        finally:
+            _log_req(req.method, req.url.path, status,
+                     (time.monotonic() - t0) * 1000)
+        return resp
+
+    @app.get("/gpu", response_class=_Plain)
+    def get_gpu(req: _Request):
+        with _cache_lock:
+            age      = time.monotonic() - _cache["last_run"]
+            has_data = bool(_cache["last_run"])
+        if not has_data or age >= _RATE_LIMIT:
+            _refresh()
+            age = 0.0
+        browser = _is_browser(req)
+        with _cache_lock:
+            body = _cache["plain" if browser else "ansi"]
+        if age > 0:
+            remain = round(_RATE_LIMIT - age, 1)
+            body   = f"# [cached] last updated {round(age,1)}s ago (refresh in {remain}s)\n" + body
+        return _Plain(body, headers={"X-Cache": "HIT" if age > 0 else "MISS",
+                                     "X-Cache-Age": str(round(age, 1))})
+
+    @app.get("/log", response_class=_Plain)
+    def get_macli_log():
+        return _Plain(_tail(_MACLI_LOG_FILE, 1000))
+
+    @app.get("/server-log", response_class=_Plain)
+    def get_server_log():
+        with _srv_log_lock:
+            recent = list(_srv_log[-1000:])
+        return _Plain("\n".join(recent) + "\n" if recent else "(no requests yet)\n")
+
+    @app.get("/health")
+    def health():
+        with _cache_lock:
+            last = _cache["last_run"]
+        age = round(time.monotonic() - last, 1) if last > 0 else None
+        return {"status": "ok", "cache_age_s": age, "port": port}
+
+    @app.post("/sms")
+    async def sms_receive(req: _Request):
+        _token    = os.environ.get("SMS_RELAY_TOKEN", "")
+        _sms_file = Path(os.environ.get(
+            "SMS_CODE_FILE",
+            str(Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+                / "macli" / "huaweicloud.sms"),
+        ))
+        if not _token:
+            return _JSON({"error": "SMS_RELAY_TOKEN not set"}, status_code=503)
+        try:
+            body = await req.json()
+        except Exception:
+            return _JSON({"error": "invalid JSON"}, status_code=400)
+        token = body.get("token") or req.headers.get("X-SMS-Token", "")
+        if token != _token:
+            return _JSON({"error": "forbidden"}, status_code=403)
+        code = str(body.get("code", "")).strip()
+        if not code:
+            return _JSON({"error": "empty code"}, status_code=400)
+        _sms_file.parent.mkdir(parents=True, exist_ok=True)
+        _sms_file.write_text(code)
+        return {"ok": True, "received": code}
+
+    cprint(f"[cyan]macli server  http://0.0.0.0:{port}[/cyan]")
+    for route in ("/gpu", "/log", "/server-log", "/health"):
+        cprint(f"  http://localhost:{port}{route}")
+    _uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
+
+
 def cmd_whoami(args):
     d = load_session()
     if not d: cprint("[red]未登录[/red]"); return
@@ -4160,6 +4469,14 @@ macli delete <JOB_ID> [-y | --yes] [-f | --force]  # -f/--force 会强制删除�
     q.add_argument("--reset-topic",      dest="reset_topic", action="store_true",
                    help="重新生成 ntfy topic（原快捷指令配置将失效）")
 
+    q = sub.add_parser("server", help="管理 GPU 状态 HTTP 服务（/gpu /log /server-log）")
+    q.add_argument("server_action", nargs="?",
+                   choices=["enable", "disable", "status", "run"],
+                   default="status",
+                   help="操作：status（默认）/ enable / disable / run")
+    q.add_argument("--port", type=int, default=None, metavar="PORT",
+                   help="监听端口，默认 8086")
+
     q = sub.add_parser("watch", help="管理定时检查任务（保活 + 清理终止作业）")
     q.add_argument("watch_action", nargs="?",
                    choices=["enable", "disable", "status", "run"],
@@ -4401,6 +4718,7 @@ macli delete <JOB_ID> [-y | --yes] [-f | --force]  # -f/--force 会强制删除�
         {"login":        cmd_login,
          "logout":       cmd_logout,
          "autologin":    cmd_autologin,
+         "server":       cmd_server,
          "watch":        cmd_watch,
          "whoami":       cmd_whoami,
          "jobs":         cmd_list_jobs,
