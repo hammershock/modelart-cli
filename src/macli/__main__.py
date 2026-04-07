@@ -2212,7 +2212,7 @@ def _server_run(args):
         except Exception:
             return "—"
 
-    def _dev_cell(d):
+    def _dev_cell(d, use_ansi):
         util       = d.get("util")
         vram_used  = d.get("vram_used_mb")
         vram_total = d.get("vram_total_mb")
@@ -2260,7 +2260,7 @@ def _server_run(args):
                 tbl.add_row(job_short, ssh, cpu, mem, created, dur, "—")
             else:
                 for i, d in enumerate(devs):
-                    cell = _dev_cell(d)
+                    cell = _dev_cell(d, use_ansi)
                     if i == 0:
                         tbl.add_row(job_short, ssh, cpu, mem, created, dur, cell)
                     else:
