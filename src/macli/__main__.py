@@ -1893,8 +1893,11 @@ def _server_status():
     if cfg:
         cprint(f"  端口        : {port}")
         cprint(f"  /gpu        : http://localhost:{port}/gpu")
+        cprint(f"  /ports      : http://localhost:{port}/ports")
         cprint(f"  /log        : http://localhost:{port}/log")
+        cprint(f"  /watch-log  : http://localhost:{port}/watch-log")
         cprint(f"  /server-log : http://localhost:{port}/server-log")
+        cprint(f"  /health     : http://localhost:{port}/health")
         cprint(f"  日志文件    : [dim]{_SERVER_LOG_FILE}[/dim]")
 
 def _server_enable(args):
@@ -1947,6 +1950,27 @@ def _server_run(args):
     _RATE_LIMIT = 10.0
     _cache_lock = _threading.Lock()
     _cache      = {"last_run": 0.0, "ansi": "", "plain": ""}
+
+    # ── 通用缓存子进程调用 ──────────────────────────────────
+    class _CachedCall:
+        """对 macli 子进程调用结果按 TTL 缓存，线程安全。"""
+        def __init__(self, ttl: float):
+            self.ttl      = ttl
+            self.last_run = 0.0
+            self.result   = None   # None = 尚未采集
+            self.lock     = _threading.Lock()
+
+        def get(self, fetch_fn):
+            """返回缓存值（未过期）或执行 fetch_fn() 刷新后返回。"""
+            with self.lock:
+                age = time.monotonic() - self.last_run
+                if self.result is None or age >= self.ttl:
+                    self.result   = fetch_fn()
+                    self.last_run = time.monotonic()
+                return self.result, round(time.monotonic() - self.last_run, 1)
+
+    _ports_cache  = _CachedCall(ttl=30.0)
+    _health_cache = _CachedCall(ttl=60.0)
     _srv_log: list = []
     _srv_log_lock  = _threading.Lock()
 
@@ -2092,37 +2116,56 @@ def _server_run(args):
 
     @app.get("/health")
     def health():
+        def _fetch_login():
+            r = _subprocess.run(
+                [sys.executable, "-m", "macli", "whoami", "--json"],
+                capture_output=True, text=True, timeout=20,
+            )
+            if r.returncode == 0:
+                try:
+                    d = json.loads(r.stdout)
+                    return {"logged_in": True,
+                            "user": d.get("user"),
+                            "session_age_hours": d.get("session_age_hours")}
+                except (json.JSONDecodeError, KeyError):
+                    pass
+            return {"logged_in": False}
+
+        login, _ = _health_cache.get(_fetch_login)
         with _cache_lock:
             last = _cache["last_run"]
-        age = round(time.monotonic() - last, 1) if last > 0 else None
-        return {"status": "ok", "cache_age_s": age, "port": port}
+        gpu_age = round(time.monotonic() - last, 1) if last > 0 else None
+        return {"status": "ok", "port": port,
+                "gpu_cache_age_s": gpu_age, **login}
 
-    @app.post("/sms")
-    async def sms_receive(req: _Request):
-        _token    = os.environ.get("SMS_RELAY_TOKEN", "")
-        _sms_file = Path(os.environ.get(
-            "SMS_CODE_FILE",
-            str(Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-                / "macli" / "huaweicloud.sms"),
-        ))
-        if not _token:
-            return _JSON({"error": "SMS_RELAY_TOKEN not set"}, status_code=503)
-        try:
-            body = await req.json()
-        except Exception:
-            return _JSON({"error": "invalid JSON"}, status_code=400)
-        token = body.get("token") or req.headers.get("X-SMS-Token", "")
-        if token != _token:
-            return _JSON({"error": "forbidden"}, status_code=403)
-        code = str(body.get("code", "")).strip()
-        if not code:
-            return _JSON({"error": "empty code"}, status_code=400)
-        _sms_file.parent.mkdir(parents=True, exist_ok=True)
-        _sms_file.write_text(code)
-        return {"ok": True, "received": code}
+    @app.get("/watch-log", response_class=_Plain)
+    def get_watch_log():
+        _watch_log = Path(os.environ.get(
+            "XDG_CONFIG_HOME", Path.home() / ".config"
+        )) / "macli" / "watch.log"
+        return _Plain(_tail(_watch_log, 1000))
+
+    @app.get("/ports")
+    def get_ports():
+        def _fetch_ports():
+            r = _subprocess.run(
+                [sys.executable, "-m", "macli", "ports", "--json"],
+                capture_output=True, text=True, timeout=60,
+            )
+            if r.returncode == 0:
+                try:
+                    return json.loads(r.stdout)
+                except json.JSONDecodeError:
+                    pass
+            return []
+
+        data, age = _ports_cache.get(_fetch_ports)
+        from fastapi.responses import JSONResponse as _JResp
+        return _JResp(content=data,
+                      headers={"X-Cache-Age": str(age)})
 
     cprint(f"[cyan]macli server  http://0.0.0.0:{port}[/cyan]")
-    for route in ("/gpu", "/log", "/server-log", "/health"):
+    for route in ("/gpu", "/ports", "/log", "/watch-log", "/server-log", "/health"):
         cprint(f"  http://localhost:{port}{route}")
     _uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
 
