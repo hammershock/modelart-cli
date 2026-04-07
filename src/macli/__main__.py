@@ -2236,38 +2236,53 @@ def _server_run(args):
     def _render_jobs(jobs: list, use_ansi: bool) -> str:
         if not jobs:
             return "No running jobs.\n"
+
+        # 按创建时间升序累计 GPU 数，最先占满配额的任务为稳定主机
+        _GPU_QUOTA = 8
+        sorted_asc = sorted(jobs, key=lambda r: r.get("create_time") or 0)
+        stable_ids: set = set()
+        _used = 0
+        for r in sorted_asc:
+            n = len(r.get("gpu_devices") or []) or 1
+            if _used + n <= _GPU_QUOTA:
+                stable_ids.add(r.get("job_id"))
+            _used += n
+
         buf = _StringIO()
         con = _RConsole(file=buf, force_terminal=use_ansi, force_jupyter=False,
-                        highlight=False, markup=False, width=130,
+                        highlight=False, markup=False, width=140,
                         color_system="truecolor" if use_ansi else None)
         tbl = _RTable(show_header=True,
                       header_style="bold cyan" if use_ansi else "",
                       show_lines=False, pad_edge=False)
-        for col, kw in [("job",     dict(min_width=8,  no_wrap=True)),
-                        ("ssh",     dict(width=7,       no_wrap=True)),
-                        ("cpu%",    dict(width=5,       no_wrap=True)),
-                        ("mem",     dict(width=8,       no_wrap=True)),
-                        ("created", dict(width=10,      no_wrap=True)),
-                        ("dur",     dict(width=10,      no_wrap=True)),
-                        ("devices", dict(min_width=32,  no_wrap=False))]:
+        for col, kw in [("",       dict(width=2,       no_wrap=True)),
+                        ("job",    dict(min_width=8,   no_wrap=True)),
+                        ("ssh",    dict(width=7,        no_wrap=True)),
+                        ("cpu%",   dict(width=5,        no_wrap=True)),
+                        ("mem",    dict(width=8,        no_wrap=True)),
+                        ("created",dict(width=10,       no_wrap=True)),
+                        ("dur",    dict(width=10,       no_wrap=True)),
+                        ("devices",dict(min_width=32,   no_wrap=False))]:
             tbl.add_column(col, **kw)
         for r in jobs:
             devs      = r.get("gpu_devices", [])
-            job_short = (r.get("job_id") or "?")[:8]
+            job_id    = r.get("job_id") or "?"
+            job_short = job_id[:8]
+            flag      = "🏠" if job_id in stable_ids else "⚠️"
             ssh       = r.get("ssh_port") or "—"
             cpu       = _fmt_pct(r.get("cpu"))
             mem       = _fmt_mem(r.get("mem"))
             created   = _fmt_created(r.get("create_time"))
             dur       = _fmt_dur(r.get("duration_ms"))
             if not devs:
-                tbl.add_row(job_short, ssh, cpu, mem, created, dur, "—")
+                tbl.add_row(flag, job_short, ssh, cpu, mem, created, dur, "—")
             else:
                 for i, d in enumerate(devs):
                     cell = _dev_cell(d, use_ansi)
                     if i == 0:
-                        tbl.add_row(job_short, ssh, cpu, mem, created, dur, cell)
+                        tbl.add_row(flag, job_short, ssh, cpu, mem, created, dur, cell)
                     else:
-                        tbl.add_row("", "", "", "", "", "", cell)
+                        tbl.add_row("", "", "", "", "", "", "", cell)
         con.print(tbl)
         return buf.getvalue()
 
