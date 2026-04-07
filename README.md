@@ -5,13 +5,25 @@
 ## 安装
 
 ```bash
-pip install git+https://github.com/hammershock/modelart-cli.git
+git clone https://github.com/hammershock/modelart-cli.git
+git pull
+cd path/to/modelart-cli/
+pip install -e .
 ```
 
 ## 快速开始
 
 ```bash
-macli login                     # 登录
+macli login 
+macli region select --name cn-north-9
+macli workspace select --name SAI2
+macli identityfile add /path/to/your/sshidentityfile
+macli exec --backend ssh
+macli watch enable
+macli watch run
+macli server enable
+macli autologin enable
+
 macli jobs --running            # 列出运行中的作业
 macli usage                     # 查看 GPU/CPU 用量
 macli exec <JOB_ID> -- nvidia-smi   # 在容器内执行命令
