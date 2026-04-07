@@ -1853,6 +1853,8 @@ def _watch_enable(args):
     }
 
     if _IS_LINUX:
+        if _cron_watch_is_active():
+            cprint("[dim]watch 已在运行，重新安装 cron 条目...[/dim]")
         Path(log_path).parent.mkdir(parents=True, exist_ok=True)
         _cron_watch_install(interval_h, str(script_path), threshold_hours, log_path)
         _save_watch_cfg(cfg)
@@ -1860,6 +1862,8 @@ def _watch_enable(args):
         cprint(f"  脚本：{script_path}")
         cprint(f"  日志：{log_path}")
     else:
+        if _launchctl_is_loaded():
+            cprint("[dim]watch 已在运行，重新加载...[/dim]")
         # 写 plist
         _WATCH_PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
         _launchctl("unload")   # 先卸载（忽略失败）
@@ -1981,7 +1985,9 @@ def _server_linux_is_running() -> bool:
         return False
 
 
-def _server_linux_start(port: int) -> bool:
+def _server_linux_start(port: int) -> None:
+    """Start server as background process. Raises RuntimeError on startup failure."""
+    import time as _time
     _SERVER_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     _server_linux_stop()
     log_fd = open(str(_SERVER_LOG_FILE), "a")
@@ -1993,8 +1999,15 @@ def _server_linux_start(port: int) -> bool:
         close_fds=True,
     )
     log_fd.close()
+    _time.sleep(1.5)
+    if proc.poll() is not None:
+        try:
+            lines = _SERVER_LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+            tail = "\n".join(lines[-5:])
+        except Exception:
+            tail = "(无法读取日志)"
+        raise RuntimeError(f"server 启动失败：\n{tail}")
     _SERVER_PID_FILE.write_text(str(proc.pid), encoding="utf-8")
-    return True
 
 
 def _server_linux_stop():
@@ -2056,10 +2069,18 @@ def _server_enable(args):
     cfg.update({"enabled": True, "port": port})
     _save_server_cfg(cfg)
     if _IS_LINUX:
-        _server_linux_start(port)
+        if _server_linux_is_running():
+            cprint("[dim]server 已在运行，重新启动...[/dim]")
+        try:
+            _server_linux_start(port)
+        except RuntimeError as e:
+            cprint(f"[red]{e}[/red]")
+            sys.exit(1)
         cprint(f"[green]✓ server 已启用  http://localhost:{port}/gpu[/green]")
         cprint(f"  日志：{_SERVER_LOG_FILE}")
     else:
+        if _server_launchctl_is_loaded():
+            cprint("[dim]server 已在运行，重新加载...[/dim]")
         _SERVER_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
         _SERVER_PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
         _server_launchctl("unload")
