@@ -6,7 +6,8 @@ version: 0.0.1
 """
 import os, sys, json, time, re, copy, argparse, subprocess as _subprocess, tempfile, shutil, ssl, socket, base64, struct, urllib.parse, threading, tty, termios, select, signal
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+_CST = timezone(timedelta(hours=8))
 
 
 def _ensure_pkg(*packages: str) -> None:
@@ -129,7 +130,7 @@ def _flog(level: str, msg: str):
     """向日志文件追加一条记录。忽略 IO 错误以免影响主流程。"""
     if _LOG_PATH is None:
         return
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ts = datetime.now(_CST).strftime("%Y-%m-%dT%H:%M:%S+08")
     line = f"{level}: {ts}: {_strip_rich(str(msg)).strip()}\n"
     try:
         with open(_LOG_PATH, "a", encoding="utf-8") as f:
@@ -627,7 +628,7 @@ def ms_to_hms(ms):
 
 def ts_to_str(ts):
     if not ts: return "--"
-    try: return datetime.fromtimestamp(int(ts) / 1000).strftime("%Y-%m-%d %H:%M")
+    try: return datetime.fromtimestamp(int(ts) / 1000, tz=_CST).strftime("%Y-%m-%d %H:%M")
     except: return str(ts)
 
 
@@ -2170,7 +2171,7 @@ def _server_run(args):
 
     # ── 请求日志 ────────────────────────────────────────────
     def _log_req(method: str, path: str, status: int, ms: float, ip: str = "-"):
-        ts   = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ts   = datetime.now(_CST).strftime("%Y-%m-%dT%H:%M:%S+08")
         line = f"{ts} {ip} {method} {path} {status} {ms:.0f}ms"
         with _srv_log_lock:
             _srv_log.append(line)
@@ -2201,7 +2202,7 @@ def _server_run(args):
         if not ts:
             return "—"
         try:
-            return datetime.fromtimestamp(int(ts) / 1000).strftime("%y-%m-%d")
+            return datetime.fromtimestamp(int(ts) / 1000, tz=_CST).strftime("%y-%m-%d")
         except Exception:
             return "—"
 
@@ -2542,7 +2543,7 @@ def cmd_whoami(args):
         f"[bold]User ID:[/bold]      {d.get('agency_id','?')}\n"
         f"[bold]Workspace ID:[/bold] {d.get('workspace_id','?')}\n"
         f"[bold]保存于:[/bold]       "
-        f"{datetime.fromtimestamp(d.get('saved_at',0)).strftime('%Y-%m-%d %H:%M')}"
+        f"{datetime.fromtimestamp(d.get('saved_at',0), tz=_CST).strftime('%Y-%m-%d %H:%M')}"
         f"  ({age:.1f}h 前)",
         title="Session 状态", border_style="green"))
     
@@ -3233,9 +3234,8 @@ def _usage_panel_text(result: dict, filter_set: set = None) -> str:
             lines.append(f"{prefix}[{vram_color}]{vram_bar}[/{vram_color}] VRAM {vram_str}  {vram_util*100:.1f}%")
 
     if start_ts and end_ts:
-        from datetime import datetime as _dt
-        st = _dt.fromtimestamp(start_ts).strftime('%H:%M')
-        ed = _dt.fromtimestamp(end_ts).strftime('%H:%M')
+        st = datetime.fromtimestamp(start_ts, tz=_CST).strftime('%H:%M')
+        ed = datetime.fromtimestamp(end_ts, tz=_CST).strftime('%H:%M')
         lines.append("")
         lines.append(f"[dim]{st} {'─' * 34} {ed}[/dim]")
     return "\n".join(lines)
@@ -3606,7 +3606,7 @@ def cmd_usage(args):
             "ssh_port":     ssh_port,
             "create_time":  int(create_time) if create_time is not None else 0,
             "duration_ms":  int(duration_ms) if duration_ms is not None else 0,
-            "collected_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "collected_at": datetime.now(_CST).strftime("%Y-%m-%d %H:%M:%S"),
             "cpu":          u["metrics"].get("cpu_util",              {}).get("latest"),
             "mem":          u["metrics"].get("memory_used_megabytes", {}).get("latest"),
             "gpu":          u["metrics"].get("gpu_util",              {}).get("latest"),
