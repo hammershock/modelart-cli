@@ -2132,7 +2132,7 @@ def _server_run(args):
 
     _RATE_LIMIT = 10.0
     _cache_lock = _threading.Lock()
-    _cache      = {"last_run": 0.0, "ansi": "", "plain": ""}
+    _cache      = {"last_run": 0.0, "ansi": "", "plain": "", "jobs": []}
 
     # ── 通用缓存子进程调用 ──────────────────────────────────
     class _CachedCall:
@@ -2303,8 +2303,10 @@ def _server_run(args):
             err  = (result.stdout or result.stderr or "").strip()[:400]
             ansi = plain = f"Error (exit {result.returncode}):\n{err}\n"
         with _cache_lock:
-            _cache["ansi"]    = ansi
-            _cache["plain"]   = plain
+            _cache["ansi"]     = ansi
+            _cache["plain"]    = plain
+            if result.returncode == 0:
+                _cache["jobs"] = jobs
             _cache["last_run"] = time.monotonic()
 
     # ── tail 工具 ───────────────────────────────────────────
@@ -2353,6 +2355,40 @@ def _server_run(args):
             body   = f"# [cached] last updated {round(age,1)}s ago (refresh in {remain}s)\n" + body
         return _Plain(body, headers={"X-Cache": "HIT" if age > 0 else "MISS",
                                      "X-Cache-Age": str(round(age, 1))})
+
+    @app.get("/gpu.json")
+    def get_gpu_json():
+        with _cache_lock:
+            age      = time.monotonic() - _cache["last_run"]
+            has_data = bool(_cache["last_run"])
+        if not has_data or age >= _RATE_LIMIT:
+            _refresh()
+            age = 0.0
+        with _cache_lock:
+            jobs = list(_cache["jobs"])
+        _GPU_QUOTA = 8
+        sorted_asc = sorted(jobs, key=lambda r: r.get("create_time") or 0)
+        stable_ids: set = set()
+        _used = 0
+        for r in sorted_asc:
+            n = len(r.get("gpu_devices") or []) or 1
+            if _used + n <= _GPU_QUOTA:
+                stable_ids.add(r.get("job_id"))
+            _used += n
+        out = []
+        for r in jobs:
+            devices = []
+            for d in (r.get("gpu_devices") or []):
+                util      = d.get("util")
+                vram_used = d.get("vram_used_mb") or 0
+                vram_tot  = d.get("vram_total_mb") or 1
+                idle = ((util or 0) * 100 == 0 and vram_used / vram_tot * 100 < 3)
+                devices.append({**d, "idle": idle})
+            out.append({**r,
+                        "preemptible": r.get("job_id") not in stable_ids,
+                        "gpu_devices": devices})
+        from fastapi.responses import JSONResponse as _JResp
+        return _JResp(content=out, headers={"X-Cache-Age": str(round(age, 1))})
 
     @app.get("/log", response_class=_Plain)
     def get_macli_log():
@@ -2474,7 +2510,7 @@ def _server_run(args):
                       headers={"X-Cache-Age": str(age)})
 
     cprint(f"[cyan]macli server  http://0.0.0.0:{port}[/cyan]")
-    for route in ("/gpu", "/ports", "/log", "/watch-log", "/server-log", "/health"):
+    for route in ("/gpu", "/gpu.json", "/ports", "/log", "/watch-log", "/server-log", "/health"):
         cprint(f"  http://localhost:{port}{route}")
     _uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
 
