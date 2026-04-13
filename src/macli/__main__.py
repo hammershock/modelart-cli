@@ -456,7 +456,25 @@ def _do_auto_login(cfg: dict) -> bool:
             otp_provider=_otp_provider,
         )
         if ck:
+            # 保留原有 region/workspace 配置
+            old = load_session()
+            old_region    = old.get("region", "")
+            old_project   = old.get("project_id", "")
+            old_agency    = old.get("agency_id", "")
+            old_workspace = old.get("workspace_id", "")
+
             _setup_session_from_cookie(ck, interactive=False, http_session=http_s)
+
+            # 恢复原有 region/workspace（如果之前有配置）
+            if old_region:
+                d = load_session()
+                d["region"]       = old_region
+                d["project_id"]   = old_project
+                d["agency_id"]    = old_agency
+                d["workspace_id"] = old_workspace
+                save_session(d)
+                dprint(f"[dim]已恢复 region={old_region} workspace={old_workspace}[/dim]")
+
             cprint("[bold green]✓ 自动重新登录成功[/bold green]")
             return True
         cprint(f"[yellow]第 {attempt} 次尝试失败[/yellow]")
@@ -1736,14 +1754,7 @@ def _save_watch_cfg(cfg: dict):
 
 
 def _watch_plist_xml(interval_secs: int, script_path: str,
-                     threshold_hours: int, log_path: str,
-                     region: str = "") -> str:
-    region_args = ""
-    if region:
-        region_args = (
-            f'        <string>--region</string>\n'
-            f'        <string>{region}</string>\n'
-        )
+                     threshold_hours: int, log_path: str) -> str:
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"'
@@ -1756,7 +1767,6 @@ def _watch_plist_xml(interval_secs: int, script_path: str,
         f'        <string>{script_path}</string>\n'
         f'        <string>--threshold-hours</string>\n'
         f'        <string>{threshold_hours}</string>\n'
-        f'{region_args}'
         '    </array>\n'
         f'    <key>StartInterval</key>\n    <integer>{interval_secs}</integer>\n'
         '    <key>RunAtLoad</key>\n    <false/>\n'
@@ -1832,7 +1842,7 @@ def _watch_linux_is_running() -> bool:
 
 
 def _watch_linux_start(interval_h: float, script_path: str,
-                       threshold_hours: int, region: str) -> None:
+                       threshold_hours: int) -> None:
     _watch_linux_stop()
     _WATCH_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     log_fd = open(str(_WATCH_LOG_FILE), "a")
@@ -1840,8 +1850,6 @@ def _watch_linux_start(interval_h: float, script_path: str,
            "--script", script_path,
            "--threshold-hours", str(threshold_hours),
            "--interval", str(interval_h)]
-    if region:
-        cmd.extend(["--region", region])
     proc = _subprocess.Popen(
         cmd, stdout=log_fd, stderr=log_fd,
         start_new_session=True, close_fds=True,
@@ -1895,9 +1903,6 @@ def _watch_status(args=None):
         if getattr(args, "threshold_hours", None) is not None and args.threshold_hours != cfg.get("threshold_hours"):
             cfg["threshold_hours"] = args.threshold_hours
             changed = True
-        if getattr(args, "region", None) is not None:
-            cfg["region"] = args.region
-            changed = True
     if changed and cfg.get("enabled"):
         _save_watch_cfg(cfg)
         cprint("[green]✓ 配置已更新，重启 watch...[/green]")
@@ -1905,7 +1910,7 @@ def _watch_status(args=None):
             try:
                 _watch_linux_start(
                     cfg["interval_h"], cfg.get("script_path", ""),
-                    cfg.get("threshold_hours", 72), cfg.get("region", ""))
+                    cfg.get("threshold_hours", 72))
             except RuntimeError as e:
                 cprint(f"[red]{e}[/red]")
         # macOS 也重新加载
@@ -1914,8 +1919,7 @@ def _watch_status(args=None):
             _WATCH_PLIST_PATH.write_text(
                 _watch_plist_xml(
                     int(cfg["interval_h"] * 3600), cfg.get("script_path", ""),
-                    cfg.get("threshold_hours", 72), cfg.get("log_path", ""),
-                    region=cfg.get("region", "")),
+                    cfg.get("threshold_hours", 72), cfg.get("log_path", "")),
                 encoding="utf-8")
             _launchctl("load")
     elif changed:
@@ -1943,8 +1947,6 @@ def _watch_status(args=None):
         cprint(f"  检查脚本  : [dim]{cfg.get('script_path', '—')}[/dim]")
         cprint(f"  检查间隔  : {cfg.get('interval_h', '—')}h")
         cprint(f"  终止阈值  : {cfg.get('threshold_hours', 72)}h")
-        if cfg.get("region"):
-            cprint(f"  检查区域  : [cyan]{cfg['region']}[/cyan]")
         cprint(f"  日志文件  : [dim]{cfg.get('log_path', '—')}[/dim]")
 
     if _WATCH_STATE_FILE.exists():
@@ -1966,7 +1968,6 @@ def _watch_enable(args):
     script_arg      = getattr(args, "script",          None)
     interval_h      = getattr(args, "interval",        None) or 1.0
     threshold_hours = getattr(args, "threshold_hours", 72)
-    region          = getattr(args, "region",           None) or ""
 
     # 找脚本路径：参数 > 已保存配置 > 包内默认路径
     _bundled = Path(__file__).resolve().parents[2] / "scripts" / "check_jobs.py"
@@ -1997,7 +1998,6 @@ def _watch_enable(args):
         "script_path":     str(script_path),
         "threshold_hours": threshold_hours,
         "log_path":        log_path,
-        "region":          region,
     }
 
     if _IS_LINUX:
@@ -2009,15 +2009,13 @@ def _watch_enable(args):
             cprint("[dim]watch 已在运行，重新启动...[/dim]")
         Path(log_path).parent.mkdir(parents=True, exist_ok=True)
         try:
-            _watch_linux_start(interval_h, str(script_path), threshold_hours, region)
+            _watch_linux_start(interval_h, str(script_path), threshold_hours)
         except RuntimeError as e:
             cprint(f"[red]{e}[/red]")
             sys.exit(1)
         _save_watch_cfg(cfg)
         cprint(f"[green]✓ watch 已启用，每 {interval_h}h 执行一次（daemon）[/green]")
         cprint(f"  脚本：{script_path}")
-        if region:
-            cprint(f"  区域：{region}")
         cprint(f"  日志：{log_path}")
     else:
         if _launchctl_is_loaded():
@@ -2026,7 +2024,7 @@ def _watch_enable(args):
         _WATCH_PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
         _launchctl("unload")   # 先卸载（忽略失败）
         _WATCH_PLIST_PATH.write_text(
-            _watch_plist_xml(interval_s, str(script_path), threshold_hours, log_path, region=region),
+            _watch_plist_xml(interval_s, str(script_path), threshold_hours, log_path),
             encoding="utf-8",
         )
 
@@ -2034,8 +2032,6 @@ def _watch_enable(args):
             _save_watch_cfg(cfg)
             cprint(f"[green]✓ watch 已启用，每 {interval_h}h 执行一次[/green]")
             cprint(f"  脚本：{script_path}")
-            if region:
-                cprint(f"  区域：{region}")
             cprint(f"  日志：{log_path}")
             cprint(f"  plist：{_WATCH_PLIST_PATH}")
         else:
@@ -2062,10 +2058,8 @@ def _watch_disable():
     _save_watch_cfg(cfg)
 
 
-def _run_check_once(script_path: Path, threshold_hours: int, region: str) -> int:
+def _run_check_once(script_path: Path, threshold_hours: int) -> int:
     cmd = [sys.executable, str(script_path), "--threshold-hours", str(threshold_hours)]
-    if region:
-        cmd.extend(["--region", region])
     return _subprocess.run(cmd, text=True).returncode
 
 
@@ -2075,7 +2069,6 @@ def _watch_run(args):
     script_arg      = getattr(args, "script",          None)
     threshold_hours = getattr(args, "threshold_hours",  None)
     interval_h      = getattr(args, "interval",         None)
-    region          = getattr(args, "region",           None) or cfg.get("region", "")
 
     script_path = Path(script_arg).expanduser() if script_arg else Path(cfg.get("script_path", ""))
     if not script_path.exists():
@@ -2088,14 +2081,14 @@ def _watch_run(args):
     if interval_h is None:
         # 单次执行模式（向后兼容）
         cprint(f"[cyan]立即运行：{script_path}[/cyan]")
-        sys.exit(_run_check_once(script_path, threshold_hours, region))
+        sys.exit(_run_check_once(script_path, threshold_hours))
 
     # daemon 循环模式
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     interval_s = int(interval_h * 3600)
     cprint(f"[cyan]watch daemon 启动，每 {interval_h}h 检查一次[/cyan]")
     while True:
-        _run_check_once(script_path, threshold_hours, region)
+        _run_check_once(script_path, threshold_hours)
         time.sleep(interval_s)
 
 
@@ -2478,7 +2471,7 @@ def _server_run(args):
                     if wcfg.get("enabled"):
                         sp = wcfg.get("script_path", "")
                         if sp and Path(sp).exists():
-                            _run_check_once(Path(sp), wcfg.get("threshold_hours", 72), wcfg.get("region", ""))
+                            _run_check_once(Path(sp), wcfg.get("threshold_hours", 72))
                     result = _subprocess.run(
                         [sys.executable, "-m", "macli", "usage", "--probe", "--json"],
                         capture_output=True, text=True, timeout=120,
@@ -5157,8 +5150,6 @@ macli delete <JOB_ID> [-y | --yes] [-f | --force]  # -f/--force 会强制删除�
                    help="check_jobs.py 的路径（enable/run 时使用）")
     q.add_argument("--threshold-hours", dest="threshold_hours", type=int, default=72,
                    metavar="N", help="Terminated 作业保留时长（小时），默认 72")
-    q.add_argument("--region", default=None, metavar="REGION",
-                   help="每次检查前切换到指定区域，如 cn-north-9")
 
     q = sub.add_parser("whoami", help="显示当前登录状态")
     q.add_argument("--json", action="store_true", help="JSON 输出")
@@ -5428,7 +5419,7 @@ def main():
                         dprint("[dim]自动登录后触发 watch run[/dim]")
                         sp = wcfg.get("script_path", "")
                         if sp and Path(sp).exists():
-                            _run_check_once(Path(sp), wcfg.get("threshold_hours", 72), wcfg.get("region", ""))
+                            _run_check_once(Path(sp), wcfg.get("threshold_hours", 72))
                     dprint(f"[dim]重新执行: {sys.argv}[/dim]")
                     _flog("INFO", "会话已过期，自动重登成功，重新执行")
                     os.execvp(sys.argv[0], sys.argv)
