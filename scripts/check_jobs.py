@@ -105,8 +105,16 @@ def get_jobs() -> list:
         return []
 
 # ── 检查逻辑 ──────────────────────────────────────────────────
-def check(threshold_hours: int = DEFAULT_THRESHOLD_H):
+def check(threshold_hours: int = DEFAULT_THRESHOLD_H, region: str = ""):
     now   = datetime.now(timezone.utc)
+
+    if region:
+        info(f"切换区域：{region}")
+        out, code = macli("region", "select", "--name", region)
+        if code != 0:
+            error(f"区域切换失败：{region}")
+            return
+
     state = load_state()
     jobs  = get_jobs()
 
@@ -219,19 +227,28 @@ if __name__ == "__main__":
         metavar="N",
         help=f"Terminated 作业终止多少小时后删除（默认读取 macli watch 配置，回退 {DEFAULT_THRESHOLD_H}）",
     )
+    p.add_argument(
+        "--region", default=None,
+        metavar="REGION",
+        help="每次检查前切换到指定区域（如 cn-north-9）",
+    )
     args = p.parse_args()
+
+    # 从 session.json watch 配置读取默认值
+    watch_cfg = {}
+    try:
+        cfg_file = CONFIG_DIR / "session.json"
+        if cfg_file.exists():
+            watch_cfg = json.loads(cfg_file.read_text(encoding="utf-8")).get("watch", {})
+    except Exception:
+        pass
 
     threshold = args.threshold_hours
     if threshold is None:
-        try:
-            cfg_file = CONFIG_DIR / "session.json"
-            if cfg_file.exists():
-                threshold = json.loads(cfg_file.read_text(encoding="utf-8")).get(
-                    "watch", {}
-                ).get("threshold_hours", DEFAULT_THRESHOLD_H)
-            else:
-                threshold = DEFAULT_THRESHOLD_H
-        except Exception:
-            threshold = DEFAULT_THRESHOLD_H
+        threshold = watch_cfg.get("threshold_hours", DEFAULT_THRESHOLD_H)
 
-    check(threshold_hours=threshold)
+    region = args.region
+    if region is None:
+        region = watch_cfg.get("region", "")
+
+    check(threshold_hours=threshold, region=region)

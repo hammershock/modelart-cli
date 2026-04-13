@@ -1719,6 +1719,8 @@ _WATCH_KEY         = "watch"
 _WATCH_PLIST_LABEL = "com.macli.watch"
 _WATCH_PLIST_PATH  = Path.home() / "Library" / "LaunchAgents" / f"{_WATCH_PLIST_LABEL}.plist"
 _WATCH_STATE_FILE  = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "macli" / "watch_state.json"
+_WATCH_PID_FILE    = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "macli" / "watch.pid"
+_WATCH_LOG_FILE    = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "macli" / "watch.log"
 _WATCH_CRON_MARKER = "# macli-watch"
 _IS_LINUX          = sys.platform.startswith("linux")
 
@@ -1734,7 +1736,14 @@ def _save_watch_cfg(cfg: dict):
 
 
 def _watch_plist_xml(interval_secs: int, script_path: str,
-                     threshold_hours: int, log_path: str) -> str:
+                     threshold_hours: int, log_path: str,
+                     region: str = "") -> str:
+    region_args = ""
+    if region:
+        region_args = (
+            f'        <string>--region</string>\n'
+            f'        <string>{region}</string>\n'
+        )
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"'
@@ -1747,6 +1756,7 @@ def _watch_plist_xml(interval_secs: int, script_path: str,
         f'        <string>{script_path}</string>\n'
         f'        <string>--threshold-hours</string>\n'
         f'        <string>{threshold_hours}</string>\n'
+        f'{region_args}'
         '    </array>\n'
         f'    <key>StartInterval</key>\n    <integer>{interval_secs}</integer>\n'
         '    <key>RunAtLoad</key>\n    <false/>\n'
@@ -1810,6 +1820,57 @@ def _cron_watch_remove():
     _cron_set_lines(lines)
 
 
+def _watch_linux_is_running() -> bool:
+    if not _WATCH_PID_FILE.exists():
+        return False
+    try:
+        pid = int(_WATCH_PID_FILE.read_text(encoding="utf-8").strip())
+        os.kill(pid, 0)
+        return True
+    except (ValueError, ProcessLookupError, PermissionError):
+        return False
+
+
+def _watch_linux_start(interval_h: float, script_path: str,
+                       threshold_hours: int, region: str) -> None:
+    _watch_linux_stop()
+    _WATCH_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    log_fd = open(str(_WATCH_LOG_FILE), "a")
+    cmd = [sys.executable, "-m", "macli", "watch", "run",
+           "--script", script_path,
+           "--threshold-hours", str(threshold_hours),
+           "--interval", str(interval_h)]
+    if region:
+        cmd.extend(["--region", region])
+    proc = _subprocess.Popen(
+        cmd, stdout=log_fd, stderr=log_fd,
+        start_new_session=True, close_fds=True,
+    )
+    log_fd.close()
+    import time as _time
+    _time.sleep(1.5)
+    if proc.poll() is not None:
+        try:
+            lines = _WATCH_LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+            tail = "\n".join(lines[-5:])
+        except Exception:
+            tail = "(unable to read log)"
+        raise RuntimeError(f"watch daemon startup failed:\n{tail}")
+    _WATCH_PID_FILE.write_text(str(proc.pid), encoding="utf-8")
+
+
+def _watch_linux_stop():
+    if not _WATCH_PID_FILE.exists():
+        return
+    try:
+        pid = int(_WATCH_PID_FILE.read_text(encoding="utf-8").strip())
+        os.kill(pid, signal.SIGTERM)
+    except (ValueError, ProcessLookupError, PermissionError):
+        pass
+    finally:
+        _WATCH_PID_FILE.unlink(missing_ok=True)
+
+
 def cmd_watch(args):
     action = getattr(args, "watch_action", "status")
     if action == "enable":
@@ -1825,11 +1886,11 @@ def cmd_watch(args):
 def _watch_status():
     cfg    = _load_watch_cfg()
     if _IS_LINUX:
-        active = _cron_watch_is_active()
-        if cfg.get("enabled") and active:
-            cprint("[green]watch：[bold]已启用（cron 运行中）[/bold][/green]")
-        elif cfg.get("enabled") and not active:
-            cprint("[yellow]watch：已配置但 cron 条目未找到（建议重新 enable）[/yellow]")
+        running = _watch_linux_is_running()
+        if cfg.get("enabled") and running:
+            cprint("[green]watch：[bold]已启用（后台进程运行中）[/bold][/green]")
+        elif cfg.get("enabled") and not running:
+            cprint("[yellow]watch：已配置但进程未运行（执行 macli watch enable 重新启动）[/yellow]")
         else:
             cprint("[dim]watch：未启用[/dim]")
     else:
@@ -1845,6 +1906,8 @@ def _watch_status():
         cprint(f"  检查脚本  : [dim]{cfg.get('script_path', '—')}[/dim]")
         cprint(f"  检查间隔  : {cfg.get('interval_h', '—')}h")
         cprint(f"  终止阈值  : {cfg.get('threshold_hours', 72)}h")
+        if cfg.get("region"):
+            cprint(f"  检查区域  : [cyan]{cfg['region']}[/cyan]")
         cprint(f"  日志文件  : [dim]{cfg.get('log_path', '—')}[/dim]")
 
     if _WATCH_STATE_FILE.exists():
@@ -1864,8 +1927,9 @@ def _watch_status():
 
 def _watch_enable(args):
     script_arg      = getattr(args, "script",          None)
-    interval_h      = getattr(args, "interval",        1)
+    interval_h      = getattr(args, "interval",        None) or 1.0
     threshold_hours = getattr(args, "threshold_hours", 72)
+    region          = getattr(args, "region",           None) or ""
 
     # 找脚本路径：参数 > 已保存配置 > 包内默认路径
     _bundled = Path(__file__).resolve().parents[2] / "scripts" / "check_jobs.py"
@@ -1896,16 +1960,27 @@ def _watch_enable(args):
         "script_path":     str(script_path),
         "threshold_hours": threshold_hours,
         "log_path":        log_path,
+        "region":          region,
     }
 
     if _IS_LINUX:
+        # 清理旧 cron 条目（从 cron 迁移到 daemon）
         if _cron_watch_is_active():
-            cprint("[dim]watch 已在运行，重新安装 cron 条目...[/dim]")
+            _cron_watch_remove()
+            cprint("[dim]已清理旧 cron 条目[/dim]")
+        if _watch_linux_is_running():
+            cprint("[dim]watch 已在运行，重新启动...[/dim]")
         Path(log_path).parent.mkdir(parents=True, exist_ok=True)
-        _cron_watch_install(interval_h, str(script_path), threshold_hours, log_path)
+        try:
+            _watch_linux_start(interval_h, str(script_path), threshold_hours, region)
+        except RuntimeError as e:
+            cprint(f"[red]{e}[/red]")
+            sys.exit(1)
         _save_watch_cfg(cfg)
-        cprint(f"[green]✓ watch 已启用，每 {interval_h}h 执行一次（cron）[/green]")
+        cprint(f"[green]✓ watch 已启用，每 {interval_h}h 执行一次（daemon）[/green]")
         cprint(f"  脚本：{script_path}")
+        if region:
+            cprint(f"  区域：{region}")
         cprint(f"  日志：{log_path}")
     else:
         if _launchctl_is_loaded():
@@ -1914,7 +1989,7 @@ def _watch_enable(args):
         _WATCH_PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
         _launchctl("unload")   # 先卸载（忽略失败）
         _WATCH_PLIST_PATH.write_text(
-            _watch_plist_xml(interval_s, str(script_path), threshold_hours, log_path),
+            _watch_plist_xml(interval_s, str(script_path), threshold_hours, log_path, region=region),
             encoding="utf-8",
         )
 
@@ -1922,6 +1997,8 @@ def _watch_enable(args):
             _save_watch_cfg(cfg)
             cprint(f"[green]✓ watch 已启用，每 {interval_h}h 执行一次[/green]")
             cprint(f"  脚本：{script_path}")
+            if region:
+                cprint(f"  区域：{region}")
             cprint(f"  日志：{log_path}")
             cprint(f"  plist：{_WATCH_PLIST_PATH}")
         else:
@@ -1932,8 +2009,11 @@ def _watch_enable(args):
 
 def _watch_disable():
     if _IS_LINUX:
-        _cron_watch_remove()
-        cprint("[green]✓ watch 已停用，cron 条目已移除[/green]")
+        _watch_linux_stop()
+        # 也清理可能残留的旧 cron 条目
+        if _cron_watch_is_active():
+            _cron_watch_remove()
+        cprint("[green]✓ watch 已停用，后台进程已终止[/green]")
     else:
         _launchctl("unload")
         if _WATCH_PLIST_PATH.exists():
@@ -1945,11 +2025,20 @@ def _watch_disable():
     _save_watch_cfg(cfg)
 
 
+def _run_check_once(script_path: Path, threshold_hours: int, region: str) -> int:
+    cmd = [sys.executable, str(script_path), "--threshold-hours", str(threshold_hours)]
+    if region:
+        cmd.extend(["--region", region])
+    return _subprocess.run(cmd, text=True).returncode
+
+
 def _watch_run(args):
-    """立即执行一次检查脚本（用于测试）。"""
-    cfg            = _load_watch_cfg()
-    script_arg     = getattr(args, "script",          None)
-    threshold_hours = getattr(args, "threshold_hours", None)
+    """执行检查脚本。有 --interval 时作为 daemon 循环运行。"""
+    cfg             = _load_watch_cfg()
+    script_arg      = getattr(args, "script",          None)
+    threshold_hours = getattr(args, "threshold_hours",  None)
+    interval_h      = getattr(args, "interval",         None)
+    region          = getattr(args, "region",           None) or cfg.get("region", "")
 
     script_path = Path(script_arg).expanduser() if script_arg else Path(cfg.get("script_path", ""))
     if not script_path.exists():
@@ -1959,12 +2048,18 @@ def _watch_run(args):
     if threshold_hours is None:
         threshold_hours = cfg.get("threshold_hours", 72)
 
-    cprint(f"[cyan]立即运行：{script_path}[/cyan]")
-    result = _subprocess.run(
-        [sys.executable, str(script_path), "--threshold-hours", str(threshold_hours)],
-        text=True,
-    )
-    sys.exit(result.returncode)
+    if interval_h is None:
+        # 单次执行模式（向后兼容）
+        cprint(f"[cyan]立即运行：{script_path}[/cyan]")
+        sys.exit(_run_check_once(script_path, threshold_hours, region))
+
+    # daemon 循环模式
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    interval_s = int(interval_h * 3600)
+    cprint(f"[cyan]watch daemon 启动，每 {interval_h}h 检查一次[/cyan]")
+    while True:
+        _run_check_once(script_path, threshold_hours, region)
+        time.sleep(interval_s)
 
 
 # ── macli server ─────────────────────────────────────────────
@@ -4996,12 +5091,14 @@ macli delete <JOB_ID> [-y | --yes] [-f | --force]  # -f/--force 会强制删除�
                    choices=["enable", "disable", "status", "run"],
                    default="status",
                    help="操作：status（默认）/ enable / disable / run")
-    q.add_argument("--interval", type=float, default=1.0, metavar="H",
-                   help="检查间隔（小时），仅 enable 时生效，默认 1")
+    q.add_argument("--interval", type=float, default=None, metavar="H",
+                   help="检查间隔（小时），默认 1")
     q.add_argument("--script",   default=None, metavar="PATH",
                    help="check_jobs.py 的路径（enable/run 时使用）")
     q.add_argument("--threshold-hours", dest="threshold_hours", type=int, default=72,
                    metavar="N", help="Terminated 作业保留时长（小时），默认 72")
+    q.add_argument("--region", default=None, metavar="REGION",
+                   help="每次检查前切换到指定区域，如 cn-north-9")
 
     q = sub.add_parser("whoami", help="显示当前登录状态")
     q.add_argument("--json", action="store_true", help="JSON 输出")
