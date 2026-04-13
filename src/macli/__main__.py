@@ -2323,6 +2323,7 @@ def _server_run(args):
 
     _ports_cache  = _CachedCall(ttl=30.0)
     _health_cache = _CachedCall(ttl=3.0)
+    _jobs_cache   = _CachedCall(ttl=30.0)
     _srv_log: list = []
     _srv_log_lock  = _threading.Lock()
 
@@ -2595,6 +2596,17 @@ def _server_run(args):
             recent = list(_srv_log[-1000:])
         return _Plain("\n".join(recent) + "\n" if recent else "(no requests yet)\n")
 
+    def _fetch_jobs_for_health() -> list:
+        try:
+            sess = ConsoleSession()
+            if not sess.restore():
+                return []
+            api  = API(sess)
+            data = api.list_jobs(limit=50)
+            return [job_to_dict(j) for j in data.get("items", [])]
+        except Exception:
+            return []
+
     def _fetch_health():
         import datetime as _dt
         sess = load_session()
@@ -2726,7 +2738,7 @@ def _server_run(args):
             lines.append(f"  Last query   {_ago(last_run_ts)}  ({_cst(last_run_ts)})")
         else:
             lines.append(f"  Last query   {DIM}never{R}")
-        if logged_in and last_run_ts > 0:
+        if logged_in:
             from collections import Counter as _Counter
             phases = _Counter(j.get("status", "") for j in jobs)
             running    = phases.get("Running",    0)
@@ -2801,10 +2813,10 @@ def _server_run(args):
 
     @app.get("/health", response_class=_Plain)
     def health_human(req: _Request):
-        data, _ = _health_cache.get(_fetch_health)
+        data, _    = _health_cache.get(_fetch_health)
+        jobs, _    = _jobs_cache.get(_fetch_jobs_for_health)
         with _cache_lock:
             last_run_ts = _cache.get("last_run_ts", 0.0)
-            jobs = list(_cache["jobs"])
         browser = _is_browser(req)
         return _Plain(_render_health(data, last_run_ts, jobs, browser))
 
