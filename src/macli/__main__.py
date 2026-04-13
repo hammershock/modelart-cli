@@ -2681,7 +2681,7 @@ def _server_run(args):
         if diff < 86400: return f"{diff / 3600:.1f}h ago"
         return f"{diff / 86400:.1f}d ago"
 
-    def _render_health(data: dict, last_run_ts: float, browser: bool) -> str:
+    def _render_health(data: dict, last_run_ts: float, jobs: list, browser: bool) -> str:
         import datetime as _dt
         tz = _dt.timezone(_dt.timedelta(hours=8))
         now_str = _dt.datetime.now(tz=tz).strftime("%Y-%m-%d %H:%M:%S CST")
@@ -2691,12 +2691,14 @@ def _server_run(args):
         al    = data.get("autologin", {})
 
         if browser:
-            B = R = G = RED = C = DIM = ""
+            B = R = G = Y = RED = GR = C = DIM = ""
         else:
             B   = "\033[1m"
             R   = "\033[0m"
             G   = "\033[32m"
+            Y   = "\033[33m"
             RED = "\033[31m"
+            GR  = "\033[90m"   # gray
             C   = "\033[36m"
             DIM = "\033[2m"
 
@@ -2718,17 +2720,45 @@ def _server_run(args):
             lines.append(f"  Session age  {login['session_age_hours']}h")
         lines.append("")
 
-        # GPU
+        # GPU + Jobs
         lines.append(f"{C}{B}GPU{R}")
         if last_run_ts > 0:
             lines.append(f"  Last query   {_ago(last_run_ts)}  ({_cst(last_run_ts)})")
         else:
             lines.append(f"  Last query   {DIM}never{R}")
+        if logged_in and last_run_ts > 0:
+            from collections import Counter as _Counter
+            phases = _Counter(j.get("status", "") for j in jobs)
+            running    = phases.get("Running",    0)
+            pending    = phases.get("Pending",    0)
+            terminated = phases.get("Terminated", 0) + phases.get("Stopped", 0)
+            failed     = phases.get("Failed",     0)
+            if jobs:
+                if running:
+                    lines.append(f"  {G}● Running{R}     {running}")
+                if pending:
+                    lines.append(f"  {Y}● Pending{R}     {pending}")
+                if terminated:
+                    lines.append(f"  {GR}● Terminated{R}  {terminated}")
+                if failed:
+                    lines.append(f"  {RED}● Failed{R}      {failed}")
+            else:
+                lines.append(f"  {DIM}(no jobs){R}")
         lines.append("")
 
         # Watch
-        watch_on = watch.get("enabled", False)
-        lines.append(f"{C}{B}Watch{R}  {dot(watch_on)}{'enabled' if watch_on else 'disabled'}")
+        watch_on  = watch.get("enabled", False)
+        has_pending = any(j.get("status") == "Pending" for j in jobs)
+        if not watch_on:
+            w_dot   = dot(False)
+            w_label = "disabled"
+        elif has_pending:
+            w_dot   = dot(True)
+            w_label = "enabled"
+        else:
+            w_dot   = f"{Y}●{R} " if not browser else "● "
+            w_label = "enabled  (检查暂未及时发生)"
+        lines.append(f"{C}{B}Watch{R}  {w_dot}{w_label}")
         if watch.get("interval_h"):
             lines.append(f"  Interval     every {watch['interval_h']}h")
         last_check = watch.get("last_check")
@@ -2774,8 +2804,9 @@ def _server_run(args):
         data, _ = _health_cache.get(_fetch_health)
         with _cache_lock:
             last_run_ts = _cache.get("last_run_ts", 0.0)
+            jobs = list(_cache["jobs"])
         browser = _is_browser(req)
-        return _Plain(_render_health(data, last_run_ts, browser))
+        return _Plain(_render_health(data, last_run_ts, jobs, browser))
 
     @app.get("/watch-log", response_class=_Plain)
     def get_watch_log():
