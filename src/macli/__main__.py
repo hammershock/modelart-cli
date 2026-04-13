@@ -2466,6 +2466,7 @@ def _server_run(args):
             [sys.executable, "-m", "macli", "usage", "--probe", "--json"],
             capture_output=True, text=True, timeout=120,
         )
+        jobs = None
         if result.returncode == 0:
             try:
                 data = json.loads(result.stdout)
@@ -2480,7 +2481,7 @@ def _server_run(args):
         with _cache_lock:
             _cache["ansi"]     = ansi
             _cache["plain"]    = plain
-            if result.returncode == 0:
+            if jobs is not None:
                 _cache["jobs"] = jobs
             _cache["last_run"] = time.monotonic()
 
