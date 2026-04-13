@@ -3735,6 +3735,8 @@ def cmd_usage(args):
                                                     detail_hint=job_detail)
                     port_cache.save()
                 except SessionExpiredError:
+                    if os.environ.get("MACLI_NO_AUTOLOGIN"):
+                        raise
                     cprint("[yellow]WARN: session 已失效，使用缓存 SSH 端口进行探测[/yellow]")
                     probe_ssh_entries = port_cache.get(args.job_id)
                 if not probe_ssh_entries:
@@ -3779,7 +3781,7 @@ def cmd_usage(args):
                                        for j in running_jobs
                                        if j.get("metadata", {}).get("id")})
     except SessionExpiredError:
-        if use_probe and probe_backend == "ssh":
+        if use_probe and probe_backend == "ssh" and not os.environ.get("MACLI_NO_AUTOLOGIN"):
             cprint("[yellow]WARN: session 已失效，使用缓存 SSH 端口进行探测[/yellow]")
             degraded[0] = True
             running_jobs = [
