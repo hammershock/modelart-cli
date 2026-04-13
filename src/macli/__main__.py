@@ -492,11 +492,12 @@ def _autologin_record_outcome(success: bool) -> bool:
     data = load_session()
     cfg  = data.get(_AUTOLOGIN_KEY, {})
     if success:
+        cfg["last_autologin_ts"] = time.time()
         if cfg.get("consecutive_failures", 0) != 0:
             cfg["consecutive_failures"] = 0
             cfg["circuit_tripped"]      = False
-            data[_AUTOLOGIN_KEY] = cfg
-            save_session(data)
+        data[_AUTOLOGIN_KEY] = cfg
+        save_session(data)
         return False
     threshold = int(cfg.get("circuit_breaker", 3))
     failures  = int(cfg.get("consecutive_failures", 0)) + 1
@@ -2300,7 +2301,7 @@ def _server_run(args):
 
     _RATE_LIMIT = 10.0
     _cache_lock = _threading.Lock()
-    _cache      = {"last_run": 0.0, "ansi": "", "plain": "", "jobs": []}
+    _cache      = {"last_run": 0.0, "last_run_ts": 0.0, "ansi": "", "plain": "", "jobs": []}
 
     # ── 通用缓存子进程调用 ──────────────────────────────────
     class _CachedCall:
@@ -2496,7 +2497,8 @@ def _server_run(args):
             _cache["plain"]    = plain
             if jobs is not None:
                 _cache["jobs"] = jobs
-            _cache["last_run"] = time.monotonic()
+            _cache["last_run"]    = time.monotonic()
+            _cache["last_run_ts"] = time.time()
 
     # ── tail 工具 ───────────────────────────────────────────
     def _tail(path: Path, n: int) -> str:
@@ -2593,79 +2595,187 @@ def _server_run(args):
             recent = list(_srv_log[-1000:])
         return _Plain("\n".join(recent) + "\n" if recent else "(no requests yet)\n")
 
-    @app.get("/health")
-    def health():
-        def _fetch():
-            sess = load_session()
-            ck   = sess.get("cookies", {})
+    def _fetch_health():
+        import datetime as _dt
+        sess = load_session()
+        ck   = sess.get("cookies", {})
 
-            # ── login ─────────────────────────────────────────
-            saved_at  = sess.get("saved_at", 0)
-            age_h     = round((time.time() - saved_at) / 3600, 1) if saved_at else None
-            login = {
-                "logged_in":         bool(ck and sess.get("project_id")),
-                "user":              ck.get("masked_user", ""),
-                "domain":            ck.get("masked_domain", ""),
-                "session_age_hours": age_h,
-            }
+        # ── login ─────────────────────────────────────────
+        saved_at  = sess.get("saved_at", 0)
+        age_h     = round((time.time() - saved_at) / 3600, 1) if saved_at else None
+        login = {
+            "logged_in":         bool(ck and sess.get("project_id")),
+            "user":              ck.get("masked_user", ""),
+            "domain":            ck.get("masked_domain", ""),
+            "session_age_hours": age_h,
+        }
 
-            # ── server ────────────────────────────────────────
-            srv = sess.get(_SERVER_KEY, {})
-            server = {
-                "enabled": srv.get("enabled", False),
-                "running": _server_linux_is_running() if _IS_LINUX else _server_launchctl_is_loaded(),
-                "port":    srv.get("port", 8086),
-            }
+        # ── server ────────────────────────────────────────
+        srv = sess.get(_SERVER_KEY, {})
+        server = {
+            "enabled": srv.get("enabled", False),
+            "running": _server_linux_is_running() if _IS_LINUX else _server_launchctl_is_loaded(),
+            "port":    srv.get("port", 8086),
+        }
 
-            # ── watch ─────────────────────────────────────────
-            wch = sess.get(_WATCH_KEY, {})
-            last_check = None
+        # ── watch ─────────────────────────────────────────
+        wch = sess.get(_WATCH_KEY, {})
+        last_check = None
+        try:
+            if _WATCH_STATE_FILE.exists():
+                ws = json.loads(_WATCH_STATE_FILE.read_text(encoding="utf-8"))
+                last_check = ws.get("last_check")
+        except Exception:
+            pass
+        watch = {
+            "enabled":         wch.get("enabled", False),
+            "running":         _cron_watch_is_active() if _IS_LINUX else _launchctl_is_loaded(),
+            "interval_h":      wch.get("interval_h"),
+            "threshold_hours": wch.get("threshold_hours"),
+            "last_check":      last_check,
+        }
+
+        # ── autologin ─────────────────────────────────────
+        al = sess.get(_AUTOLOGIN_KEY, {})
+        autologin = {
+            "enabled":              al.get("enabled", False),
+            "otp_channel":          "webhook" if al.get("webhook_url") else ("ntfy" if al.get("ntfy_topic") else "none"),
+            "webhook_url":          al.get("webhook_url", ""),
+            "circuit_tripped":      al.get("circuit_tripped", False),
+            "consecutive_failures": al.get("consecutive_failures", 0),
+            "circuit_breaker":      al.get("circuit_breaker", 3),
+            "last_autologin_ts":    al.get("last_autologin_ts", 0),
+        }
+
+        # ── exec / identityfiles ──────────────────────────
+        idf_map, idf_default = load_identityfiles()
+        exec_info = {
+            "backend":             sess.get("exec_backend", "cloudshell"),
+            "identityfiles":       idf_map,
+            "default_identityfile": idf_default,
+        }
+
+        return {
+            "login":    login,
+            "server":   server,
+            "watch":    watch,
+            "autologin": autologin,
+            "exec":     exec_info,
+        }
+
+    def _cst(ts: float) -> str:
+        import datetime as _dt
+        tz = _dt.timezone(_dt.timedelta(hours=8))
+        return _dt.datetime.fromtimestamp(ts, tz=tz).strftime("%Y-%m-%d %H:%M:%S CST")
+
+    def _cst_iso(s: str) -> str:
+        import datetime as _dt
+        dt = _dt.datetime.fromisoformat(s.rstrip("Z")).replace(tzinfo=_dt.timezone.utc)
+        tz = _dt.timezone(_dt.timedelta(hours=8))
+        return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S CST")
+
+    def _ago(ts: float) -> str:
+        diff = time.time() - ts
+        if diff < 60:    return f"{int(diff)}s ago"
+        if diff < 3600:  return f"{int(diff / 60)}m ago"
+        if diff < 86400: return f"{diff / 3600:.1f}h ago"
+        return f"{diff / 86400:.1f}d ago"
+
+    def _render_health(data: dict, last_run_ts: float, browser: bool) -> str:
+        import datetime as _dt
+        tz = _dt.timezone(_dt.timedelta(hours=8))
+        now_str = _dt.datetime.now(tz=tz).strftime("%Y-%m-%d %H:%M:%S CST")
+
+        login = data.get("login",     {})
+        watch = data.get("watch",     {})
+        al    = data.get("autologin", {})
+
+        if browser:
+            B = R = G = RED = C = DIM = ""
+        else:
+            B   = "\033[1m"
+            R   = "\033[0m"
+            G   = "\033[32m"
+            RED = "\033[31m"
+            C   = "\033[36m"
+            DIM = "\033[2m"
+
+        def dot(ok: bool) -> str:
+            if browser: return "● " if ok else "○ "
+            return f"{G}●{R} " if ok else f"{RED}●{R} "
+
+        lines = []
+        lines.append(f"{B}macli Health{R}  {DIM}{now_str}{R}")
+        lines.append("")
+
+        # Login
+        lines.append(f"{C}{B}Login{R}")
+        logged_in = login.get("logged_in", False)
+        lines.append(f"  Status       {dot(logged_in)}{'logged in' if logged_in else 'NOT logged in'}")
+        if login.get("user"):
+            lines.append(f"  User         {login['user']}  {login.get('domain', '')}")
+        if login.get("session_age_hours") is not None:
+            lines.append(f"  Session age  {login['session_age_hours']}h")
+        lines.append("")
+
+        # GPU
+        lines.append(f"{C}{B}GPU{R}")
+        if last_run_ts > 0:
+            lines.append(f"  Last query   {_ago(last_run_ts)}  ({_cst(last_run_ts)})")
+        else:
+            lines.append(f"  Last query   {DIM}never{R}")
+        lines.append("")
+
+        # Watch
+        watch_on = watch.get("enabled", False)
+        lines.append(f"{C}{B}Watch{R}  {dot(watch_on)}{'enabled' if watch_on else 'disabled'}")
+        if watch.get("interval_h"):
+            lines.append(f"  Interval     every {watch['interval_h']}h")
+        last_check = watch.get("last_check")
+        if last_check:
             try:
-                if _WATCH_STATE_FILE.exists():
-                    ws = json.loads(_WATCH_STATE_FILE.read_text(encoding="utf-8"))
-                    last_check = ws.get("last_check")
+                lines.append(f"  Last run     {_cst_iso(last_check)}")
             except Exception:
-                pass
-            watch = {
-                "enabled":         wch.get("enabled", False),
-                "running":         _cron_watch_is_active() if _IS_LINUX else _launchctl_is_loaded(),
-                "interval_h":      wch.get("interval_h"),
-                "threshold_hours": wch.get("threshold_hours"),
-                "last_check":      last_check,
-            }
+                lines.append(f"  Last run     {last_check}")
+        else:
+            lines.append(f"  Last run     {DIM}never{R}")
+        lines.append("")
 
-            # ── autologin ─────────────────────────────────────
-            al = sess.get(_AUTOLOGIN_KEY, {})
-            autologin = {
-                "enabled":              al.get("enabled", False),
-                "otp_channel":          "webhook" if al.get("webhook_url") else ("ntfy" if al.get("ntfy_topic") else "none"),
-                "webhook_url":          al.get("webhook_url", ""),
-                "circuit_tripped":      al.get("circuit_tripped", False),
-                "consecutive_failures": al.get("consecutive_failures", 0),
-                "circuit_breaker":      al.get("circuit_breaker", 3),
-            }
+        # Autologin
+        al_on    = al.get("enabled", False)
+        channel  = al.get("otp_channel", "none")
+        lines.append(f"{C}{B}Autologin{R}  {dot(al_on)}{'enabled' if al_on else 'disabled'}  {DIM}[{channel}]{R}")
+        al_ts = al.get("last_autologin_ts", 0)
+        if al_ts:
+            lines.append(f"  Last login   {_ago(al_ts)}  ({_cst(al_ts)})")
+        else:
+            lines.append(f"  Last login   {DIM}never{R}")
+        tripped  = al.get("circuit_tripped", False)
+        failures = al.get("consecutive_failures", 0)
+        threshold = al.get("circuit_breaker", 3)
+        if tripped:
+            lines.append(f"  Circuit      {dot(False)}tripped  ({failures}/{threshold} failures)")
+        else:
+            lines.append(f"  Circuit      {dot(True)}normal  ({failures}/{threshold} failures)")
+        lines.append("")
 
-            # ── exec / identityfiles ──────────────────────────
-            idf_map, idf_default = load_identityfiles()
-            exec_info = {
-                "backend":             sess.get("exec_backend", "cloudshell"),
-                "identityfiles":       idf_map,
-                "default_identityfile": idf_default,
-            }
+        return "\n".join(lines)
 
-            return {
-                "login":    login,
-                "server":   server,
-                "watch":    watch,
-                "autologin": autologin,
-                "exec":     exec_info,
-            }
-
-        data, _ = _health_cache.get(_fetch)
+    @app.get("/health.json")
+    def health():
+        data, _ = _health_cache.get(_fetch_health)
         with _cache_lock:
             last = _cache["last_run"]
         gpu_age = round(time.monotonic() - last, 1) if last > 0 else None
         return {"status": "ok", "port": port, "gpu_cache_age_s": gpu_age, **data}
+
+    @app.get("/health", response_class=_Plain)
+    def health_human(req: _Request):
+        data, _ = _health_cache.get(_fetch_health)
+        with _cache_lock:
+            last_run_ts = _cache.get("last_run_ts", 0.0)
+        browser = _is_browser(req)
+        return _Plain(_render_health(data, last_run_ts, browser))
 
     @app.get("/watch-log", response_class=_Plain)
     def get_watch_log():
