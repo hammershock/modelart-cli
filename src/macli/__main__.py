@@ -1697,7 +1697,8 @@ def cmd_logout(args):
     elif p.exists():
         p.unlink()
 
-    cleared_creds = _clear_saved_creds()
+    purge = getattr(args, "purge", False)
+    cleared_creds = _clear_saved_creds() if purge else False
 
     if had_session_state or cleared_creds:
         parts = []
@@ -1706,6 +1707,9 @@ def cmd_logout(args):
         cprint(f"[green]✓ 已清除：{' 及 '.join(parts)}[/green]")
         if data:
             cprint("[dim]已保留其他配置：如 autologin、identityfiles、exec backend 等[/dim]")
+        if had_session_state and not purge:
+            cprint("[dim]提示：keyring 账号密码已保留（autologin 可复用），"
+                   "如需彻底清除请使用 macli logout --purge[/dim]")
     else:
         cprint("[yellow]当前没有已保存的登录凭据[/yellow]")
 
@@ -4964,7 +4968,8 @@ macli delete <JOB_ID> [-y | --yes] [-f | --force]  # -f/--force 会强制删除�
     q.add_argument("--interactive", dest="interactive", action="store_true",
                    help="登录后交互式选择 region 和 workspace")
 
-    sub.add_parser("logout", help="清除已保存的登录凭据（config/session.json）")
+    q = sub.add_parser("logout", help="清除登录 session（keyring 凭据默认保留，--purge 可一并删除）")
+    q.add_argument("--purge", action="store_true", help="同时清除 keyring 中保存的账号密码")
 
     q = sub.add_parser("autologin", help="管理会话过期时的自动重新登录")
     q.add_argument("action", nargs="?", choices=["enable", "disable", "status"],
