@@ -1880,11 +1880,48 @@ def cmd_watch(args):
     elif action == "run":
         _watch_run(args)
     else:
-        _watch_status()
+        _watch_status(args)
 
 
-def _watch_status():
+def _watch_status(args=None):
     cfg    = _load_watch_cfg()
+
+    # 内联配置更新：传了参数时更新 cfg 并重启 daemon
+    changed = False
+    if args is not None:
+        if getattr(args, "interval", None) is not None:
+            cfg["interval_h"] = args.interval
+            changed = True
+        if getattr(args, "threshold_hours", None) is not None and args.threshold_hours != cfg.get("threshold_hours"):
+            cfg["threshold_hours"] = args.threshold_hours
+            changed = True
+        if getattr(args, "region", None) is not None:
+            cfg["region"] = args.region
+            changed = True
+    if changed and cfg.get("enabled"):
+        _save_watch_cfg(cfg)
+        cprint("[green]✓ 配置已更新，重启 watch...[/green]")
+        if _IS_LINUX:
+            try:
+                _watch_linux_start(
+                    cfg["interval_h"], cfg.get("script_path", ""),
+                    cfg.get("threshold_hours", 72), cfg.get("region", ""))
+            except RuntimeError as e:
+                cprint(f"[red]{e}[/red]")
+        # macOS 也重新加载
+        elif _WATCH_PLIST_PATH.exists():
+            _launchctl("unload")
+            _WATCH_PLIST_PATH.write_text(
+                _watch_plist_xml(
+                    int(cfg["interval_h"] * 3600), cfg.get("script_path", ""),
+                    cfg.get("threshold_hours", 72), cfg.get("log_path", ""),
+                    region=cfg.get("region", "")),
+                encoding="utf-8")
+            _launchctl("load")
+    elif changed:
+        _save_watch_cfg(cfg)
+        cprint("[green]✓ 配置已更新[/green]")
+
     if _IS_LINUX:
         running = _watch_linux_is_running()
         if cfg.get("enabled") and running:
