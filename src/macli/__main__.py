@@ -2462,10 +2462,30 @@ def _server_run(args):
         return buf.getvalue()
 
     def _refresh():
+        env = {**os.environ, "MACLI_NO_AUTOLOGIN": "1"}
         result = _subprocess.run(
             [sys.executable, "-m", "macli", "usage", "--probe", "--json"],
-            capture_output=True, text=True, timeout=120,
+            capture_output=True, text=True, timeout=120, env=env,
         )
+        # exit code 2 = session expired；在 server 进程内执行 autologin 后重试
+        if result.returncode == 2:
+            al_cfg = _load_auto_login_cfg()
+            if al_cfg.get("enabled"):
+                dprint("[dim]server: session 过期，触发自动登录[/dim]")
+                if _do_auto_login(al_cfg):
+                    _autologin_record_outcome(True)
+                    wcfg = _load_watch_cfg()
+                    if wcfg.get("enabled"):
+                        sp = wcfg.get("script_path", "")
+                        if sp and Path(sp).exists():
+                            _run_check_once(Path(sp), wcfg.get("threshold_hours", 72), wcfg.get("region", ""))
+                    result = _subprocess.run(
+                        [sys.executable, "-m", "macli", "usage", "--probe", "--json"],
+                        capture_output=True, text=True, timeout=120,
+                    )
+                else:
+                    _autologin_record_outcome(False)
+
         jobs = None
         if result.returncode == 0:
             try:
@@ -5395,7 +5415,7 @@ def main():
             exit_code = result if isinstance(result, int) else 0
         except SessionExpiredError as e:
             cfg = _load_auto_login_cfg()
-            if cfg.get("enabled"):
+            if cfg.get("enabled") and not os.environ.get("MACLI_NO_AUTOLOGIN"):
                 dprint(f"[dim]SessionExpiredError: {e}，触发自动登录[/dim]")
                 ok = _do_auto_login(cfg)
                 if ok:
