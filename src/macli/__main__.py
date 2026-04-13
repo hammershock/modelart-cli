@@ -5399,6 +5399,13 @@ def main():
                 ok = _do_auto_login(cfg)
                 if ok:
                     _autologin_record_outcome(True)
+                    # 登录成功后立即触发一次 watch 检查（保活）
+                    wcfg = _load_watch_cfg()
+                    if wcfg.get("enabled"):
+                        dprint("[dim]自动登录后触发 watch run[/dim]")
+                        sp = wcfg.get("script_path", "")
+                        if sp and Path(sp).exists():
+                            _run_check_once(Path(sp), wcfg.get("threshold_hours", 72), wcfg.get("region", ""))
                     dprint(f"[dim]重新执行: {sys.argv}[/dim]")
                     _flog("INFO", "会话已过期，自动重登成功，重新执行")
                     os.execvp(sys.argv[0], sys.argv)
