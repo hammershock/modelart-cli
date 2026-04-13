@@ -379,9 +379,28 @@ def _ntfy_poll_otp(topic: str, since_ts: int, timeout: int = 120) -> str:
     return ""
 
 
+def _webhook_poll_otp(webhook_url: str, timeout: int = 120) -> str:
+    """
+    长轮询本地 macli server /otp/wait 端点，返回 6 位验证码。
+    超时或失败时返回空字符串。
+    """
+    url = webhook_url.rstrip("/") + "/otp/wait"
+    dprint(f"[dim]webhook 轮询开始  url={url}  timeout={timeout}[/dim]")
+    try:
+        r = requests.get(url, params={"timeout": timeout}, timeout=timeout + 10)
+        dprint(f"[dim]webhook 响应 HTTP {r.status_code}  body={r.text[:120]!r}[/dim]")
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("ok") and data.get("code"):
+                return data["code"]
+    except Exception as ex:
+        dprint(f"[dim]webhook 轮询异常: {ex}[/dim]")
+    return ""
+
+
 def _do_auto_login(cfg: dict) -> bool:
     """
-    用 keyring 中存储的账号密码 + ntfy OTP 通道自动完成登录，
+    用 keyring 中存储的账号密码 + webhook/ntfy OTP 通道自动完成登录，
     成功后更新 session.json 并返回 True，失败返回 False。
     """
     creds = _load_saved_creds()
@@ -389,17 +408,19 @@ def _do_auto_login(cfg: dict) -> bool:
         cprint("[red]自动登录失败：keyring 中无账号密码，请先执行 macli autologin enable[/red]")
         return False
 
+    webhook_url = cfg.get("webhook_url", "")
     ntfy_topic  = cfg.get("ntfy_topic", "")
     max_retries = int(cfg.get("max_retries", 3))
     otp_timeout = int(cfg.get("otp_wait_secs", 120))
 
-    if not ntfy_topic:
-        cprint("[red]自动登录失败：未配置 ntfy_topic，请执行 macli autologin enable[/red]")
+    if not webhook_url and not ntfy_topic:
+        cprint("[red]自动登录失败：未配置 webhook_url 或 ntfy_topic，请执行 macli autologin enable[/red]")
         return False
 
+    otp_mode = "webhook" if webhook_url else "ntfy"
     cprint(
         f"\n[bold cyan]⟳ 会话已过期，自动重新登录[/bold cyan]"
-        f"  [dim]{creds['username']} @ {creds['domain']}[/dim]"
+        f"  [dim]{creds['username']} @ {creds['domain']}  (OTP: {otp_mode})[/dim]"
     )
 
     for attempt in range(1, max_retries + 1):
@@ -409,15 +430,26 @@ def _do_auto_login(cfg: dict) -> bool:
         # 捕获 poll_since 在闭包外，每次尝试都重新记录
         poll_since = int(time.time())
 
-        def _otp_provider(since=poll_since) -> str:
-            dprint(f"[dim]ntfy 开始轮询，since={since}，topic={ntfy_topic}，timeout={otp_timeout}s[/dim]")
-            cprint(f"[cyan]  ⟳ 等待手机验证码（最多 {otp_timeout} 秒）...[/cyan]")
-            code = _ntfy_poll_otp(ntfy_topic, since, timeout=otp_timeout)
-            if not code:
-                cprint("[yellow]  验证码等待超时[/yellow]")
-            else:
-                dprint(f"[dim]ntfy 收到验证码: {code}[/dim]")
-            return code
+        if webhook_url:
+            def _otp_provider() -> str:
+                dprint(f"[dim]webhook 开始轮询，url={webhook_url}，timeout={otp_timeout}s[/dim]")
+                cprint(f"[cyan]  ⟳ 等待手机验证码（最多 {otp_timeout} 秒）...[/cyan]")
+                code = _webhook_poll_otp(webhook_url, timeout=otp_timeout)
+                if not code:
+                    cprint("[yellow]  验证码等待超时[/yellow]")
+                else:
+                    dprint(f"[dim]webhook 收到验证码: {code}[/dim]")
+                return code
+        else:
+            def _otp_provider(since=poll_since) -> str:
+                dprint(f"[dim]ntfy 开始轮询，since={since}，topic={ntfy_topic}，timeout={otp_timeout}s[/dim]")
+                cprint(f"[cyan]  ⟳ 等待手机验证码（最多 {otp_timeout} 秒）...[/cyan]")
+                code = _ntfy_poll_otp(ntfy_topic, since, timeout=otp_timeout)
+                if not code:
+                    cprint("[yellow]  验证码等待超时[/yellow]")
+                else:
+                    dprint(f"[dim]ntfy 收到验证码: {code}[/dim]")
+                return code
 
         ck, http_s = _http_login(
             creds["domain"], creds["username"], creds["password"],
@@ -1468,6 +1500,12 @@ def _manual_cookie_input() -> str:
 
 
 def cmd_login(args):
+    # 登录命令始终重新认证，不复用缓存 cookie（避免直接返回过期的旧 cookie）
+    if not getattr(args, "cookie", None):
+        d = load_session()
+        d.pop("cookie_str", None)
+        save_session(d)
+
     ck, http_session = _get_cookie_from_args_or_input(args)
 
     # 登录失败时，只有 --cookie 路径才继续
@@ -2320,6 +2358,10 @@ def _server_run(args):
         except OSError as e:
             return f"(error: {e})\n"
 
+    # ── OTP slot (for autologin webhook) ─────────────────────
+    import asyncio as _asyncio
+    _otp_slot: dict = {"code": "", "expires": 0.0, "event": _asyncio.Event()}
+
     # ── App ─────────────────────────────────────────────────
     app = _FastAPI(title="macli server")
 
@@ -2446,6 +2488,8 @@ def _server_run(args):
             al = sess.get(_AUTOLOGIN_KEY, {})
             autologin = {
                 "enabled":              al.get("enabled", False),
+                "otp_channel":          "webhook" if al.get("webhook_url") else ("ntfy" if al.get("ntfy_topic") else "none"),
+                "webhook_url":          al.get("webhook_url", ""),
                 "circuit_tripped":      al.get("circuit_tripped", False),
                 "consecutive_failures": al.get("consecutive_failures", 0),
                 "circuit_breaker":      al.get("circuit_breaker", 3),
@@ -2510,8 +2554,39 @@ def _server_run(args):
         return _JResp(content=enriched,
                       headers={"X-Cache-Age": str(age)})
 
+    # ── OTP webhook endpoints ────────────────────────────────
+    @app.post("/otp")
+    async def recv_otp(req: _Request):
+        body = (await req.body()).decode(errors="replace").strip()
+        # 支持 JSON {"code":"123456"} 或纯文本
+        try:
+            data = json.loads(body)
+            text = str(data.get("code") or data.get("message") or "").strip()
+        except Exception:
+            text = body
+        m = re.search(r"\b(\d{6})\b", text)
+        if not m:
+            return _JSON({"ok": False, "error": "no 6-digit code found"}, status_code=400)
+        _otp_slot["code"] = m.group(1)
+        _otp_slot["expires"] = time.time() + 90
+        _otp_slot["event"].set()
+        return _JSON({"ok": True})
+
+    @app.get("/otp/wait")
+    async def wait_otp(timeout: int = 120):
+        _otp_slot["event"].clear()
+        try:
+            await _asyncio.wait_for(_otp_slot["event"].wait(), timeout=timeout)
+        except _asyncio.TimeoutError:
+            return _JSON({"ok": False, "error": "timeout"}, status_code=408)
+        if time.time() > _otp_slot["expires"]:
+            return _JSON({"ok": False, "error": "code expired"}, status_code=410)
+        code = _otp_slot["code"]
+        _otp_slot["event"].clear()
+        return _JSON({"ok": True, "code": code})
+
     cprint(f"[cyan]macli server  http://0.0.0.0:{port}[/cyan]")
-    for route in ("/gpu", "/gpu.json", "/ports", "/log", "/watch-log", "/server-log", "/health"):
+    for route in ("/gpu", "/gpu.json", "/ports", "/log", "/watch-log", "/server-log", "/health", "/otp"):
         cprint(f"  http://localhost:{port}{route}")
     _uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
 
@@ -4602,8 +4677,23 @@ def cmd_ssh(args):
     os.execvp("ssh", ssh_cmd)
 
 
+def _autologin_print_cfg(cfg: dict):
+    """打印自动登录配置摘要。"""
+    webhook_url = cfg.get("webhook_url", "")
+    ntfy_topic  = cfg.get("ntfy_topic", "")
+    if webhook_url:
+        cprint(f"  OTP 通道  : [cyan]webhook → {webhook_url}[/cyan]")
+    elif ntfy_topic:
+        cprint(f"  OTP 通道  : [cyan]ntfy → {ntfy_topic}[/cyan]")
+    else:
+        cprint(f"  OTP 通道  : [dim]未配置[/dim]")
+    cprint(f"  最大重试次数: {cfg.get('max_retries', 3)}")
+    cprint(f"  验证码等待 : {cfg.get('otp_wait_secs', 120)} 秒")
+    cprint(f"  熔断阈值   : {cfg.get('circuit_breaker', 3)} 次连续失败")
+
+
 def cmd_autologin(args):
-    """查询/启用/停用会话过期时的自动重新登录（keyring 账号密码 + ntfy OTP 通道）。"""
+    """查询/启用/停用会话过期时的自动重新登录（keyring 账号密码 + webhook/ntfy OTP 通道）。"""
     import getpass as _getpass
     import secrets as _secrets
 
@@ -4636,10 +4726,7 @@ def cmd_autologin(args):
                 cprint("[yellow]自动登录：[bold]未启用[/bold][/yellow]")
         else:
             cprint("[green]自动登录：[bold]已启用[/bold][/green]")
-            cprint(f"  ntfy topic : [cyan]{cfg.get('ntfy_topic', '—')}[/cyan]")
-            cprint(f"  最大重试次数: {cfg.get('max_retries', 3)}")
-            cprint(f"  验证码等待 : {cfg.get('otp_wait_secs', 120)} 秒")
-            cprint(f"  熔断阈值   : {cfg.get('circuit_breaker', 3)} 次连续失败")
+            _autologin_print_cfg(cfg)
             failures = int(cfg.get("consecutive_failures", 0))
             if failures > 0:
                 cprint(f"  [yellow]当前连续失败: {failures} 次[/yellow]")
@@ -4687,10 +4774,7 @@ def cmd_autologin(args):
             cprint("[green]✓ 配置已更新[/green]")
         else:
             cprint("[dim]自动登录已启用，无参数变更[/dim]")
-        cprint(f"  ntfy topic : [cyan]{cfg.get('ntfy_topic', '—')}[/cyan]")
-        cprint(f"  最大重试次数: {cfg.get('max_retries', 3)}")
-        cprint(f"  验证码等待 : {cfg.get('otp_wait_secs', 120)} 秒")
-        cprint(f"  熔断阈值   : {cfg.get('circuit_breaker', 3)} 次连续失败")
+        _autologin_print_cfg(cfg)
         creds = _load_saved_creds()
         if creds.get("username"):
             cprint(f"  keyring 账号: [dim]{creds['username']} @ {creds['domain']}[/dim]")
@@ -4714,14 +4798,31 @@ def cmd_autologin(args):
     else:
         cprint(f"[green]✓ 使用 keyring 账号：{creds['username']} @ {creds['domain']}[/green]")
 
-    # 生成或复用 ntfy_topic
-    existing_topic = cfg.get("ntfy_topic", "")
-    if getattr(args, "reset_topic", False) or not existing_topic:
-        ntfy_topic = "macli-" + _secrets.token_hex(8)
-        dprint(f"[dim]生成新 ntfy topic: {ntfy_topic}[/dim]")
+    # OTP 通道选择：webhook（推荐）或 ntfy（降级）
+    cprint("\n[bold]选择 OTP 通道：[/bold]")
+    cprint("  [cyan]1.[/cyan] webhook（推荐 — 手机直接 POST 到 macli server）")
+    cprint("  [cyan]2.[/cyan] ntfy.sh（公网中转）")
+    otp_choice = input("\n请选择 (1/2) [1]: ").strip() or "1"
+
+    if otp_choice == "1":
+        # webhook 模式
+        existing_url = cfg.get("webhook_url", "")
+        default_url = existing_url or "http://localhost:8086"
+        cprint(f"\n[dim]填写手机可访问的 macli server 地址（SSH 隧道/内网穿透/Tailscale 均可）[/dim]")
+        webhook_url = input(f"webhook URL [{default_url}]: ").strip() or default_url
+        # 清理末尾斜杠
+        webhook_url = webhook_url.rstrip("/")
+        ntfy_topic = cfg.get("ntfy_topic", "")  # 保留旧的，不再生成新的
     else:
-        ntfy_topic = existing_topic
-        dprint(f"[dim]复用已有 ntfy topic: {ntfy_topic}[/dim]")
+        # ntfy 模式
+        webhook_url = ""
+        existing_topic = cfg.get("ntfy_topic", "")
+        if getattr(args, "reset_topic", False) or not existing_topic:
+            ntfy_topic = "macli-" + _secrets.token_hex(8)
+            dprint(f"[dim]生成新 ntfy topic: {ntfy_topic}[/dim]")
+        else:
+            ntfy_topic = existing_topic
+            dprint(f"[dim]复用已有 ntfy topic: {ntfy_topic}[/dim]")
 
     max_retries     = getattr(args, "retries",          None) or int(cfg.get("max_retries",    3))
     otp_timeout     = getattr(args, "timeout",          None) or int(cfg.get("otp_wait_secs", 120))
@@ -4729,6 +4830,7 @@ def cmd_autologin(args):
 
     cfg.update({
         "enabled":              True,
+        "webhook_url":          webhook_url,
         "ntfy_topic":           ntfy_topic,
         "max_retries":          max_retries,
         "otp_wait_secs":        otp_timeout,
@@ -4740,36 +4842,52 @@ def cmd_autologin(args):
     cprint("[bold green]✓ 自动登录已启用[/bold green]")
 
     # 打印 iPhone 快捷指令配置指南
-    ntfy_url = f"https://ntfy.sh/{ntfy_topic}"
-    ntfy_publish_url = "https://ntfy.sh"
-    console.print(Panel(
-        f"[bold]iPhone 快捷指令配置（推荐：整条短信原文直传）[/bold]\n\n"
-        f"[bold cyan]推荐 URL[/bold cyan]\n"
-        f"  {ntfy_url}\n\n"
-        f"[bold cyan]方法[/bold cyan]\n"
-        f"  POST\n\n"
-        f"[bold cyan]Headers（可选）[/bold cyan]\n"
-        f"  Content-Type  →  text/plain; charset=utf-8\n\n"
-        f"[bold cyan]请求体[/bold cyan]\n"
-        f"  [yellow]<整条短信原文 / 转成纯文本后的快捷指令输入>[/yellow]\n\n"
-        f"[dim]macli 会在收到的消息正文里自动提取首个 6 位数字验证码，无需手机端先做正则。[/dim]\n\n"
-        f"---\n\n"
-        f"[bold]建议快捷指令流程：[/bold]\n"
-        f"  1. 触发条件：收到含「验证码」的短信\n"
-        f"  2. 用 [获取文本] 把“快捷指令输入”转换成纯文本\n"
-        f"  3. [获取URL内容] → POST {ntfy_url}\n"
-        f"     Header: Content-Type = text/plain; charset=utf-8\n"
-        f"     请求体: [yellow]<上一步得到的整条短信文本>[/yellow]\n\n"
-        f"[bold]备用方案（若你更想发 JSON）[/bold]\n"
-        f"  URL: {ntfy_publish_url}\n"
-        f"  Header: Content-Type = application/json\n"
-        f"  JSON 请求体: topic = [cyan]{ntfy_topic}[/cyan]\n"
-        f"                 message = [yellow]<整条短信文本>[/yellow]",
-        title="[bold]自动登录 — 手机快捷指令配置指南[/bold]",
-        border_style="cyan",
-        padding=(1, 2),
-    ))
-    cprint(f"\n[dim]配置已保存。ntfy topic 请妥善保管（泄露后他人可读取验证码）[/dim]")
+    if webhook_url:
+        otp_post_url = f"{webhook_url}/otp"
+        console.print(Panel(
+            f"[bold]iPhone 快捷指令配置[/bold]\n\n"
+            f"  1. 自动化 → 收到含「验证码」的短信时触发\n"
+            f"  2. 获取文本 → 将快捷指令输入转为纯文本\n"
+            f"  3. 获取URL内容:\n"
+            f"       POST  [cyan]{otp_post_url}[/cyan]\n"
+            f"       请求体 = [yellow]整条短信原文[/yellow]\n\n"
+            f"[dim]macli 自动从短信中提取 6 位验证码，手机端无需做正则。[/dim]\n\n"
+            f"[bold]验证：[/bold]curl -X POST {otp_post_url} -d '123456'",
+            title="[bold]自动登录 — Webhook 配置[/bold]",
+            border_style="cyan",
+            padding=(1, 2),
+        ))
+    else:
+        ntfy_url = f"https://ntfy.sh/{ntfy_topic}"
+        ntfy_publish_url = "https://ntfy.sh"
+        console.print(Panel(
+            f"[bold]iPhone 快捷指令配置（推荐：整条短信原文直传）[/bold]\n\n"
+            f"[bold cyan]推荐 URL[/bold cyan]\n"
+            f"  {ntfy_url}\n\n"
+            f"[bold cyan]方法[/bold cyan]\n"
+            f"  POST\n\n"
+            f"[bold cyan]Headers（可选）[/bold cyan]\n"
+            f"  Content-Type  →  text/plain; charset=utf-8\n\n"
+            f"[bold cyan]请求体[/bold cyan]\n"
+            f"  [yellow]<整条短信原文 / 转成纯文本后的快捷指令输入>[/yellow]\n\n"
+            f"[dim]macli 会在收到的消息正文里自动提取首个 6 位数字验证码，无需手机端先做正则。[/dim]\n\n"
+            f"---\n\n"
+            f"[bold]建议快捷指令流程：[/bold]\n"
+            f"  1. 触发条件：收到含「验证码」的短信\n"
+            f"  2. 用 [获取文本] 把「快捷指令输入」转换成纯文本\n"
+            f"  3. [获取URL内容] → POST {ntfy_url}\n"
+            f"     Header: Content-Type = text/plain; charset=utf-8\n"
+            f"     请求体: [yellow]<上一步得到的整条短信文本>[/yellow]\n\n"
+            f"[bold]备用方案（若你更想发 JSON）[/bold]\n"
+            f"  URL: {ntfy_publish_url}\n"
+            f"  Header: Content-Type = application/json\n"
+            f"  JSON 请求体: topic = [cyan]{ntfy_topic}[/cyan]\n"
+            f"                 message = [yellow]<整条短信文本>[/yellow]",
+            title="[bold]自动登录 — 手机快捷指令配置指南[/bold]",
+            border_style="cyan",
+            padding=(1, 2),
+        ))
+        cprint(f"\n[dim]配置已保存。ntfy topic 请妥善保管（泄露后他人可读取验证码）[/dim]")
 
 
 def _main_impl():
