@@ -3000,6 +3000,7 @@ def cmd_list_jobs(args):
                        or args.name or args.status)
     if need_filter:
         jobs = _fetch_all_jobs(api)
+        total = len(jobs)
     else:
         PAGE = 50
         jobs  = []
@@ -3038,7 +3039,6 @@ def cmd_list_jobs(args):
     if not jobs:
         cprint("[yellow]没有找到符合条件的训练作业[/yellow]"); return
 
-    total = data.get("total", 0)
     t = Table(title=f"训练作业（总计 {total} 个，过滤后显示 {len(jobs)} 个）",
               header_style="bold cyan", show_lines=False)
     t.add_column("#",        width=3)
@@ -3883,8 +3883,8 @@ def cmd_usage(args):
     degraded = [False]
 
     try:
-        jobs = api.list_jobs(limit=args.limit).get("items", [])
-        running_jobs = [j for j in jobs if j.get("status", {}).get("phase") == "Running"]
+        all_jobs = _fetch_all_jobs(api)
+        running_jobs = [j for j in all_jobs if j.get("status", {}).get("phase") == "Running"]
         port_cache.evict_non_running({j.get("metadata", {}).get("id", "")
                                        for j in running_jobs
                                        if j.get("metadata", {}).get("id")})
