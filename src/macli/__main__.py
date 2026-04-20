@@ -2602,8 +2602,7 @@ def _server_run(args):
             if not sess.restore():
                 return []
             api  = API(sess)
-            data = api.list_jobs(limit=50)
-            return [job_to_dict(j) for j in data.get("items", [])]
+            return [job_to_dict(j) for j in _fetch_all_jobs(api)]
         except Exception:
             return []
 
