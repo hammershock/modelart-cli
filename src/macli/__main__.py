@@ -2974,29 +2974,22 @@ def _read_piped_ids() -> list:
 
 
 def _fetch_all_jobs(api: "API", max_items: int = 500) -> list:
-    """拉取所有作业。
-    API 的 offset 参数被忽略，每次最多返回 50 条。通过同时查 desc（最新50）和
-    asc（最旧50）再去重，覆盖最多 100 个作业的全集；超过 100 时仍可覆盖两端。
+    """分页拉取所有作业。
+    API 的 offset 是页码（0-indexed），每页最多 50 条，limit 硬限 ≤50。
     """
-    data_desc = api.list_jobs(limit=50, offset=0, order="desc")
-    total     = data_desc.get("total", 0)
-    desc_items = data_desc.get("items", [])
-
-    if total <= 50:
-        dprint(f"[dim]_fetch_all_jobs: {len(desc_items)} 个作业（total={total}）[/dim]")
-        return desc_items
-
-    # total > 50: 再查 asc 拿另一端，去重合并
-    asc_items = api.list_jobs(limit=50, offset=0, order="asc").get("items", [])
-    seen: set = set()
+    PAGE = 50
     jobs: list = []
-    for j in desc_items + asc_items:
-        jid = j.get("metadata", {}).get("id")
-        if jid and jid not in seen:
-            seen.add(jid)
-            jobs.append(j)
-    dprint(f"[dim]_fetch_all_jobs: {len(jobs)} 个作业（total={total}，"
-           f"desc={len(desc_items)} asc={len(asc_items)}）[/dim]")
+    page_num = 0
+    total = 0
+    while True:
+        data  = api.list_jobs(limit=PAGE, offset=page_num)
+        total = data.get("total", 0)
+        page  = data.get("items", [])
+        jobs += page
+        page_num += 1
+        if not page or len(jobs) >= total or len(jobs) >= max_items:
+            break
+    dprint(f"[dim]_fetch_all_jobs: 共拉取 {len(jobs)} 个作业（total={total}）[/dim]")
     return jobs
 
 
@@ -3013,16 +3006,16 @@ def cmd_list_jobs(args):
         total = len(jobs)
     else:
         PAGE = 50
-        jobs  = []
-        total = 0
-        offset = 0
+        jobs     = []
+        total    = 0
+        page_num = 0
         while True:
-            data   = api.list_jobs(limit=PAGE, offset=offset)
-            total  = data.get("total", 0)
-            page   = data.get("items", [])
-            jobs  += page
-            offset += len(page)
-            if len(jobs) >= args.limit or not page or offset >= total:
+            data  = api.list_jobs(limit=PAGE, offset=page_num)
+            total = data.get("total", 0)
+            page  = data.get("items", [])
+            jobs += page
+            page_num += 1
+            if len(jobs) >= args.limit or not page or len(jobs) >= total:
                 break
 
     jobs = _apply_job_filters(jobs, args)
