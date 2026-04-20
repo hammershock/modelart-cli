@@ -2684,20 +2684,18 @@ def _server_run(args):
         watch = data.get("watch",     {})
         al    = data.get("autologin", {})
 
-        if browser:
-            B = R = G = Y = RED = GR = DIM = ""
-        else:
-            B   = "\033[1m"
-            R   = "\033[0m"
-            G   = "\033[32m"
-            Y   = "\033[33m"
-            RED = "\033[31m"
-            GR  = "\033[90m"
-            DIM = "\033[2m"
-
-        def dot(ok: bool) -> str:
-            if browser: return "●" if ok else "○"
-            return f"{G}●{R}" if ok else f"{RED}●{R}"
+        logged_in = login.get("logged_in", False)
+        age_h     = login.get("session_age_hours")
+        watch_on  = watch.get("enabled", False)
+        has_pend  = any(j.get("status") == "Pending" for j in jobs)
+        iv_h      = watch.get("interval_h")
+        lc        = watch.get("last_check")
+        al_on     = al.get("enabled", False)
+        channel   = al.get("otp_channel", "none")
+        al_ts     = al.get("last_autologin_ts", 0)
+        tripped   = al.get("circuit_tripped", False)
+        failures  = al.get("consecutive_failures", 0)
+        threshold = al.get("circuit_breaker", 3)
 
         def dur(ts: float) -> str:
             diff = time.time() - ts
@@ -2706,16 +2704,102 @@ def _server_run(args):
             if diff < 86400: return f"{diff / 3600:.1f}h"
             return f"{diff / 86400:.1f}d"
 
-        logged_in = login.get("logged_in", False)
-        age_h     = login.get("session_age_hours")
+        if browser:
+            # ── 详情模式（无 ANSI 色彩，供浏览器显示）──────────────
+            def cst(ts: float) -> str:
+                return _dt.datetime.fromtimestamp(ts, tz=tz).strftime("%Y-%m-%d %H:%M:%S CST")
 
-        # ── Line 1: macli · login dot · session age · time ─────
+            def cst_iso(s: str) -> str:
+                dt = _dt.datetime.fromisoformat(s.rstrip("Z")).replace(tzinfo=_dt.timezone.utc)
+                return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S CST")
+
+            def ago(ts: float) -> str:
+                diff = time.time() - ts
+                if diff < 60:    return f"{int(diff)}s ago"
+                if diff < 3600:  return f"{int(diff / 60)}m ago"
+                if diff < 86400: return f"{diff / 3600:.1f}h ago"
+                return f"{diff / 86400:.1f}d ago"
+
+            def dot(ok: bool) -> str: return "● " if ok else "○ "
+
+            lines = []
+            lines.append(f"macli Health  {now_str}")
+            lines.append("")
+
+            lines.append("Login")
+            lines.append(f"  Status       {dot(logged_in)}{'logged in' if logged_in else 'NOT logged in'}")
+            if login.get("user"):
+                lines.append(f"  User         {login['user']}  {login.get('domain', '')}")
+            if age_h is not None:
+                lines.append(f"  Session age  {age_h}h")
+            lines.append("")
+
+            lines.append("GPU")
+            if last_run_ts > 0:
+                lines.append(f"  Last query   {ago(last_run_ts)}  ({cst(last_run_ts)})")
+            else:
+                lines.append(f"  Last query   never")
+            if logged_in:
+                from collections import Counter as _Counter
+                ph   = _Counter(j.get("status", "") for j in jobs)
+                run  = ph.get("Running",    0)
+                pend = ph.get("Pending",    0)
+                term = ph.get("Terminated", 0) + ph.get("Stopped", 0)
+                fail = ph.get("Failed",     0)
+                if jobs:
+                    if run:  lines.append(f"  ● Running     {run}")
+                    if pend: lines.append(f"  ● Pending     {pend}")
+                    if term: lines.append(f"  ● Terminated  {term}")
+                    if fail: lines.append(f"  ● Failed      {fail}")
+                else:
+                    lines.append(f"  (no jobs)")
+            lines.append("")
+
+            if not watch_on:
+                w_label = "disabled"
+            elif has_pend:
+                w_label = "enabled"
+            else:
+                w_label = "enabled  (检查暂未及时发生)"
+            lines.append(f"Watch  {dot(watch_on)}{w_label}")
+            if iv_h:
+                lines.append(f"  Interval     every {iv_h}h")
+            if lc:
+                try:    lines.append(f"  Last run     {cst_iso(lc)}")
+                except: lines.append(f"  Last run     {lc}")
+            else:
+                lines.append(f"  Last run     never")
+            lines.append("")
+
+            lines.append(f"Autologin  {dot(al_on)}{'enabled' if al_on else 'disabled'}  [{channel}]")
+            if al_ts:
+                lines.append(f"  Last login   {ago(al_ts)}  ({cst(al_ts)})")
+            else:
+                lines.append(f"  Last login   never")
+            if tripped:
+                lines.append(f"  Circuit      {dot(False)}tripped  ({failures}/{threshold} failures)")
+            else:
+                lines.append(f"  Circuit      {dot(True)}normal  ({failures}/{threshold} failures)")
+            lines.append("")
+
+            return "\n".join(lines)
+
+        # ── 紧凑模式（ANSI 彩色，供 terminal/curl 显示）─────────
+        B   = "\033[1m"
+        R   = "\033[0m"
+        G   = "\033[32m"
+        Y   = "\033[33m"
+        RED = "\033[31m"
+        GR  = "\033[90m"
+        DIM = "\033[2m"
+
+        def dot(ok: bool) -> str:
+            return f"{G}●{R}" if ok else f"{RED}●{R}"
+
         age_str = f" {age_h}h" if age_h is not None else ""
         line1 = f"{B}macli{R}  {dot(logged_in)}{age_str}  {DIM}{now_str}{R}"
 
-        # ── Line 2: GPU · job counts · Watch ───────────────────
         gpu_str = f"GPU {dur(last_run_ts)}" if last_run_ts > 0 else f"GPU {DIM}never{R}"
-
         if logged_in:
             from collections import Counter as _Counter
             ph   = _Counter(j.get("status", "") for j in jobs)
@@ -2725,11 +2809,7 @@ def _server_run(args):
             fail = ph.get("Failed",     0)
             gpu_str += f"  {G}{run}{R}│{Y}{pend}{R}│{GR}{term}{R}│{RED}{fail}{R}"
 
-        watch_on  = watch.get("enabled", False)
-        has_pend  = any(j.get("status") == "Pending" for j in jobs)
-        iv_h      = watch.get("interval_h")
-        lc        = watch.get("last_check")
-        lc_str    = ""
+        lc_str = ""
         if lc:
             try:
                 dt     = _dt.datetime.fromisoformat(lc.rstrip("Z")).replace(tzinfo=_dt.timezone.utc)
@@ -2740,28 +2820,19 @@ def _server_run(args):
         if not watch_on:
             wd, w_warn = dot(False), ""
         elif has_pend:
-            wd, w_warn = (f"{G}●{R}", "") if not browser else ("●", "")
+            wd, w_warn = f"{G}●{R}", ""
         else:
-            wd, w_warn = (f"{Y}●{R}", "") if not browser else ("●", "!")
+            wd, w_warn = f"{Y}●{R}", ""
 
-        iv_part = f" {iv_h}h" if iv_h else ""
-        lc_part = f"  {lc_str}" if lc_str else ""
+        iv_part   = f" {iv_h}h" if iv_h else ""
+        lc_part   = f"  {lc_str}" if lc_str else ""
         watch_str = f"Watch {wd}{w_warn}{iv_part}{lc_part}"
+        line2     = f"{gpu_str}   {watch_str}"
 
-        line2 = f"{gpu_str}   {watch_str}"
-
-        # ── Line 3: Autologin ───────────────────────────────────
-        al_on    = al.get("enabled", False)
-        channel  = al.get("otp_channel", "none")
-        al_ts    = al.get("last_autologin_ts", 0)
-        tripped  = al.get("circuit_tripped", False)
-        failures = al.get("consecutive_failures", 0)
-        threshold = al.get("circuit_breaker", 3)
-
-        al_last   = f"  {dur(al_ts)}" if al_ts else ""
-        cd        = dot(False) if tripped else dot(True)
-        c_label   = f"tripped {failures}/{threshold}" if tripped else f"{failures}/{threshold}"
-        line3 = f"Autologin {dot(al_on)} {channel}{al_last}  {cd} {c_label}"
+        al_last  = f"  {dur(al_ts)}" if al_ts else ""
+        cd       = dot(False) if tripped else dot(True)
+        c_label  = f"tripped {failures}/{threshold}" if tripped else f"{failures}/{threshold}"
+        line3    = f"Autologin {dot(al_on)} {channel}{al_last}  {cd} {c_label}"
 
         return f"{line1}\n{line2}\n{line3}\n"
 
