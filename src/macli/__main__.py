@@ -879,15 +879,15 @@ class API:
                 ) from e
             raise
 
-    def list_jobs(self, limit=50, offset=0) -> dict:
+    def list_jobs(self, limit=50, offset=0, order="desc") -> dict:
         r = self.sess.post("/training-job-searches", {
             "workspace_id": self.sess.workspace_id,
             "limit":        limit,
             "offset":       offset,
-            "order":        "desc",
+            "order":        order,
             "sort_by":      "create_time",
         })
-        dprint(f"[dim]API list_jobs offset={offset} limit={limit} → {r.status_code}[/dim]")
+        dprint(f"[dim]API list_jobs offset={offset} limit={limit} order={order} → {r.status_code}[/dim]")
         if r.status_code == 200:
             return self._safe_json(r)
         cprint(f"[red]列表失败 {r.status_code}: {r.text[:200]}[/red]")
@@ -2974,19 +2974,29 @@ def _read_piped_ids() -> list:
 
 
 def _fetch_all_jobs(api: "API", max_items: int = 500) -> list:
-    """分页拉取所有作业，最多拉取 max_items 条（API 每页限制 50）。"""
-    PAGE = 50
+    """拉取所有作业。
+    API 的 offset 参数被忽略，每次最多返回 50 条。通过同时查 desc（最新50）和
+    asc（最旧50）再去重，覆盖最多 100 个作业的全集；超过 100 时仍可覆盖两端。
+    """
+    data_desc = api.list_jobs(limit=50, offset=0, order="desc")
+    total     = data_desc.get("total", 0)
+    desc_items = data_desc.get("items", [])
+
+    if total <= 50:
+        dprint(f"[dim]_fetch_all_jobs: {len(desc_items)} 个作业（total={total}）[/dim]")
+        return desc_items
+
+    # total > 50: 再查 asc 拿另一端，去重合并
+    asc_items = api.list_jobs(limit=50, offset=0, order="asc").get("items", [])
+    seen: set = set()
     jobs: list = []
-    offset = 0
-    while True:
-        data   = api.list_jobs(limit=PAGE, offset=offset)
-        total  = data.get("total", 0)
-        page   = data.get("items", [])
-        jobs  += page
-        offset += len(page)
-        if not page or offset >= total or offset >= max_items:
-            break
-    dprint(f"[dim]_fetch_all_jobs: 共拉取 {len(jobs)} 个作业（total={total}）[/dim]")
+    for j in desc_items + asc_items:
+        jid = j.get("metadata", {}).get("id")
+        if jid and jid not in seen:
+            seen.add(jid)
+            jobs.append(j)
+    dprint(f"[dim]_fetch_all_jobs: {len(jobs)} 个作业（total={total}，"
+           f"desc={len(desc_items)} asc={len(asc_items)}）[/dim]")
     return jobs
 
 
