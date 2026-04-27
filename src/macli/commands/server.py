@@ -23,6 +23,7 @@ _MACLI_LOG_FILE     = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".con
 # watch 常量（health endpoint 需要）
 _WATCH_KEY         = "watch"
 _WATCH_STATE_FILE  = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "macli" / "watch_state.json"
+_DISK_STATE_FILE   = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "macli" / "disk_state.json"
 
 # ── DaemonManager 实例 ──────────────────────────────────────────
 _server_daemon = DaemonManager(
@@ -268,9 +269,66 @@ def _server_run(args):
             color = "yellow"
         return _RText(text, style=color)
 
-    def _render_jobs(jobs: list, use_ansi: bool) -> str:
+    def _load_disk_state() -> dict:
+        try:
+            if _DISK_STATE_FILE.exists():
+                return json.loads(_DISK_STATE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return {}
+
+    def _disk_job_index(disk: dict) -> dict:
+        idx = {}
+        for host in ((disk or {}).get("hosts") or {}).values():
+            df = host.get("df") or {}
+            used = int(df.get("used_bytes") or 0)
+            total = int(df.get("total_bytes") or 0)
+            evict_limit = int(total * 0.9)
+            alloc_pct = used / evict_limit * 100 if evict_limit > 0 else None
+            for job in host.get("jobs", []):
+                job_id = job.get("id")
+                if not job_id:
+                    continue
+                cache = job.get("cache_bytes")
+                share_pct = (int(cache) / used * 100
+                             if cache is not None and used > 0 else None)
+                idx[job_id] = {
+                    "alloc_pct": alloc_pct,
+                    "share_pct": share_pct,
+                }
+        return idx
+
+    def _disk_pct_text(value) -> str:
+        return f"{value:.2f}%" if value is not None else "—"
+
+    def _disk_style(value, thresholds: tuple) -> str:
+        if value is None:
+            return "dim"
+        yellow, orange, red = thresholds
+        if value >= red:
+            return "red"
+        if value >= orange:
+            return "orange1"
+        if value >= yellow:
+            return "yellow"
+        return "green"
+
+    def _disk_cell(value, thresholds: tuple, use_ansi: bool, pct_symbol_only: bool = False):
+        text = _disk_pct_text(value)
+        if not use_ansi:
+            return text
+        if pct_symbol_only and value is not None:
+            cell = _RText(f"{value:.2f}", style="grey50")
+            cell.append("%", style=_disk_style(value, thresholds))
+            return cell
+        return _RText(text, style=_disk_style(value, thresholds))
+
+    def _render_jobs(jobs: list, use_ansi: bool, disk: dict = None) -> str:
         if not jobs:
             return "No running jobs.\n"
+        disk = disk or {}
+        disk_idx = _disk_job_index(disk)
+        show_disk = bool(disk)
 
         # 按创建时间升序累计 GPU 数，最先占满配额的任务为稳定主机
         _GPU_QUOTA = 8
@@ -299,6 +357,9 @@ def _server_run(args):
                         ("dur",    dict(width=10,       no_wrap=True)),
                         ("devices",dict(min_width=32,   no_wrap=False))]:
             tbl.add_column(col, **kw)
+        if show_disk:
+            tbl.add_column("alloc%", width=8, no_wrap=True)
+            tbl.add_column("share%", width=8, no_wrap=True)
         for r in jobs:
             devs      = r.get("gpu_devices", [])
             job_id    = r.get("job_id") or "?"
@@ -309,17 +370,41 @@ def _server_run(args):
             mem       = _fmt_mem(r.get("mem"))
             created   = _fmt_created(r.get("create_time"))
             dur       = _fmt_dur(r.get("duration_ms"))
+            disk_info = disk_idx.get(job_id, {})
+            alloc = _disk_cell(disk_info.get("alloc_pct"), (50, 70, 85), use_ansi)
+            share = _disk_cell(disk_info.get("share_pct"), (10, 30, 50),
+                               use_ansi, pct_symbol_only=True)
+            row_base = [flag, job_short, ssh, cpu, mem, created, dur]
             if not devs:
-                tbl.add_row(flag, job_short, ssh, cpu, mem, created, dur, "—")
+                row = row_base + ["—"]
+                if show_disk:
+                    row += [alloc, share]
+                tbl.add_row(*row)
             else:
                 for i, d in enumerate(devs):
                     cell = _dev_cell(d, use_ansi)
                     if i == 0:
-                        tbl.add_row(flag, job_short, ssh, cpu, mem, created, dur, cell)
+                        row = row_base + [cell]
+                        if show_disk:
+                            row += [alloc, share]
+                        tbl.add_row(*row)
                     else:
-                        tbl.add_row("", "", "", "", "", "", "", cell)
+                        row = ["", "", "", "", "", "", "", cell]
+                        if show_disk:
+                            row += ["", ""]
+                        tbl.add_row(*row)
         con.print(tbl)
-        return buf.getvalue()
+        body = buf.getvalue()
+        if show_disk:
+            note = ("Allocation >= 100% is sufficient to trigger eviction. "
+                    "Eviction targets the JOB with the largest current share; "
+                    "share is this JOB's cache usage divided by allocated space. "
+                    "Other JOBs may exist and actual usage may be unknown, so share is only a decision aid.")
+            if use_ansi:
+                body += f"\033[38;5;244m{note}\033[0m\n"
+            else:
+                body += note + "\n"
+        return body
 
     def _refresh():
         env = {**os.environ, "MACLI_NO_AUTOLOGIN": "1"}
@@ -351,8 +436,9 @@ def _server_run(args):
             try:
                 data = json.loads(result.stdout)
                 jobs = data.get("jobs", [])
-                ansi  = _render_jobs(jobs, True)
-                plain = _render_jobs(jobs, False)
+                disk = _load_disk_state()
+                ansi  = _render_jobs(jobs, True, disk=disk)
+                plain = _render_jobs(jobs, False, disk=disk)
             except (json.JSONDecodeError, KeyError) as e:
                 ansi = plain = f"parse error: {e}\n{result.stdout[:300]}\n"
         else:
@@ -531,12 +617,21 @@ def _server_run(args):
             "default_identityfile": idf_default,
         }
 
+        # ── disk snapshot from watch ──────────────────────
+        disk = {}
+        try:
+            if _DISK_STATE_FILE.exists():
+                disk = json.loads(_DISK_STATE_FILE.read_text(encoding="utf-8"))
+        except Exception as e:
+            disk = {"errors": [f"read disk_state failed: {e}"]}
+
         return {
             "login":    login,
             "server":   server,
             "watch":    watch,
             "autologin": autologin,
             "exec":     exec_info,
+            "disk":     disk,
         }
 
     def _render_health(data: dict, last_run_ts: float, jobs: list, browser: bool) -> str:
@@ -547,6 +642,7 @@ def _server_run(args):
         login = data.get("login",     {})
         watch = data.get("watch",     {})
         al    = data.get("autologin", {})
+        disk  = data.get("disk",      {})
 
         logged_in = login.get("logged_in", False)
         age_h     = login.get("session_age_hours")
@@ -567,6 +663,97 @@ def _server_run(args):
             if diff < 3600:  return f"{int(diff / 60)}m"
             if diff < 86400: return f"{diff / 3600:.1f}h"
             return f"{diff / 86400:.1f}d"
+
+        def _as_int(value, default: int = 0) -> int:
+            try:
+                return int(value)
+            except Exception:
+                return default
+
+        def disk_evict_limit(host: dict) -> int:
+            df = host.get("df") or {}
+            return int(_as_int(df.get("total_bytes")) * 0.9)
+
+        def disk_alloc_ratio(host: dict) -> float:
+            df = host.get("df") or {}
+            used = _as_int(df.get("used_bytes"))
+            limit = disk_evict_limit(host)
+            return used / limit if limit > 0 else 0.0
+
+        def disk_has_large_job(host: dict) -> bool:
+            df = host.get("df") or {}
+            used = _as_int(df.get("used_bytes"))
+            if used <= 0:
+                return False
+            return any(
+                _as_int(job.get("cache_bytes")) / used > 0.10
+                for job in host.get("jobs", [])
+                if job.get("cache_bytes") is not None
+            )
+
+        def disk_attention_hosts():
+            return [
+                h for h in sorted_disk_hosts()
+                if disk_alloc_ratio(h) > 0.50 and disk_has_large_job(h)
+            ]
+
+        def fmt_disk_bytes(value, threshold: bool = False) -> str:
+            n = float(_as_int(value))
+            units = [
+                (1024 ** 4, "TB"),
+                (1024 ** 3, "GB"),
+                (1024 ** 2, "MB"),
+                (1024, "KB"),
+            ]
+            for factor, suffix in units:
+                if n >= factor:
+                    v = n / factor
+                    if suffix == "TB":
+                        digits = 2 if threshold else 1
+                    elif suffix == "KB" and v >= 10:
+                        digits = 0
+                    else:
+                        digits = 1
+                    text = f"{v:.{digits}f}".rstrip("0").rstrip(".")
+                    return f"{text}{suffix}"
+            return f"{int(n)}B"
+
+        def disk_job_list(host: dict, port_color: str = "", reset: str = "") -> str:
+            parts = []
+            for job in sorted(host.get("jobs", []), key=lambda j: j.get("port") or 0):
+                port = job.get("port", "—")
+                port_text = f"{port_color}{port}{reset}" if port_color else str(port)
+                cache = fmt_disk_bytes(job.get("cache_bytes")) if job.get("cache_bytes") is not None else "—"
+                parts.append(f"{port_text} {cache}")
+            return ", ".join(parts) if parts else "no jobs"
+
+        def disk_host_line(host: dict, value_color: str = "", accent_color: str = "", reset: str = "") -> str:
+            df = host.get("df") or {}
+            used = _as_int(df.get("used_bytes"))
+            total = _as_int(df.get("total_bytes"))
+            total_tb_display = round(total / (1024 ** 4), 1) if total > 0 else 0.0
+            limit_text = f"{total_tb_display * 0.9:.2f}TB" if total_tb_display else "—"
+            host_ip = host.get("host_ip", "UNKNOWN")
+            usage = f"{fmt_disk_bytes(used)} / {limit_text}"
+            if value_color:
+                usage = f"{value_color}{usage}{reset}"
+            host_ip_text = f"{accent_color}{host_ip}{reset}" if accent_color else host_ip
+            return (
+                f"{usage} {host_ip_text} "
+                f"({disk_job_list(host, accent_color, reset)})"
+            )
+
+        def disk_checked_ts(raw: str):
+            if not raw:
+                return None
+            try:
+                return _dt.datetime.fromisoformat(raw.rstrip("Z")).replace(tzinfo=_dt.timezone.utc).timestamp()
+            except Exception:
+                return None
+
+        def sorted_disk_hosts():
+            hosts = (disk or {}).get("hosts", {}) or {}
+            return sorted(hosts.values(), key=disk_alloc_ratio, reverse=True)
 
         if browser:
             # ── 详情模式（无 ANSI 色彩，供浏览器显示）──────────────
@@ -646,6 +833,35 @@ def _server_run(args):
                 lines.append(f"  Circuit      {dot(True)}normal  ({failures}/{threshold} failures)")
             lines.append("")
 
+            if disk:
+                ts = disk_checked_ts(disk.get("last_check"))
+                age = dur(ts) if ts else "never"
+                lines.append(
+                    f"Disk {age} hosts {len((disk.get('hosts') or {}))} "
+                    f"jobs {disk.get('jobs_checked', 0)}"
+                )
+
+                attention = disk_attention_hosts()
+                for host in attention:
+                    lines.append(disk_host_line(host))
+                if not attention:
+                    lines.append("(no hosts above filters)")
+
+                lines.append("")
+                lines.append("All hosts")
+                for host in sorted_disk_hosts():
+                    lines.append(disk_host_line(host))
+
+                if ts:
+                    lines.append("")
+                    lines.append(f"Last scan {cst(ts)}")
+                elif disk.get("last_check"):
+                    lines.append("")
+                    lines.append(f"Last scan {disk.get('last_check')}")
+                for err in disk.get("errors", []) or []:
+                    lines.append(f"Error {err}")
+                lines.append("")
+
             return "\n".join(lines)
 
         # ── 紧凑模式（ANSI 彩色，供 terminal/curl 显示）─────────
@@ -656,6 +872,8 @@ def _server_run(args):
         RED = "\033[31m"
         GR  = "\033[90m"
         DIM = "\033[2m"
+        ORANGE = "\033[38;5;214m"
+        BLUE = "\033[94m"
 
         def dot(ok: bool) -> str:
             return f"{G}●{R}" if ok else f"{RED}●{R}"
@@ -698,7 +916,32 @@ def _server_run(args):
         c_label  = f"tripped {failures}/{threshold}" if tripped else f"{failures}/{threshold}"
         line3    = f"Autologin {dot(al_on)} {channel}{al_last}  {cd} {c_label}"
 
-        return f"{line1}\n{line2}\n{line3}\n"
+        lines = [line1, line2, line3]
+        if disk:
+            ts = disk_checked_ts(disk.get("last_check"))
+            age = dur(ts) if ts else "never"
+            lines.append(
+                f"Disk {age} hosts {len((disk.get('hosts') or {}))} "
+                f"jobs {disk.get('jobs_checked', 0)}"
+            )
+
+            def disk_value_color(host: dict) -> str:
+                ratio = disk_alloc_ratio(host)
+                if ratio >= 0.85:
+                    return RED
+                if ratio >= 0.70:
+                    return ORANGE
+                if ratio >= 0.50:
+                    return Y
+                return ""
+
+            attention = disk_attention_hosts()
+            for host in attention:
+                lines.append(disk_host_line(host, disk_value_color(host), BLUE, R))
+            if not attention:
+                lines.append(f"{DIM}(no hosts above filters){R}")
+
+        return "\n".join(lines) + "\n"
 
     @app.get("/health.json")
     def health():

@@ -57,7 +57,12 @@ def cmd_detail(args):
             url = s["url"]
             port = s.get("port")
             port_show = port if port is not None else "—"
-            cprint(f"  {s['task']} [dim](port: {port_show})[/dim]: {url}")
+            ip_parts = [f"port: {port_show}"]
+            if s.get("pod_ip"):
+                ip_parts.append(f"pod_ip: {s['pod_ip']}")
+            if s.get("host_ip"):
+                ip_parts.append(f"host_ip: {s['host_ip']}")
+            cprint(f"  {s['task']} [dim]({', '.join(ip_parts)})[/dim]: {url}")
             if url.startswith("ssh://"):
                 inner = url[6:]
                 user, _, hp = inner.partition("@")

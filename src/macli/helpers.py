@@ -114,7 +114,8 @@ def resolve_ssh(api: "API", job_id: str, phase: str,
     if not detail:
         return []
     entries = enrich_ssh_entries(
-        detail.get("endpoints", {}).get("ssh", {}).get("task_urls", [])
+        detail.get("endpoints", {}).get("ssh", {}).get("task_urls", []),
+        detail.get("status", {}).get("task_ips", []),
     )
     cache.put(job_id, entries)
     return entries
@@ -145,7 +146,10 @@ def job_to_dict(j: dict, ssh_override: list = None) -> dict:
     if ssh_override is not None:
         ssh = ssh_override
     else:
-        ssh = enrich_ssh_entries(j.get("endpoints", {}).get("ssh", {}).get("task_urls", []))
+        ssh = enrich_ssh_entries(
+            j.get("endpoints", {}).get("ssh", {}).get("task_urls", []),
+            st.get("task_ips", []),
+        )
     return {
         "id":          meta.get("id", ""),
         "name":        meta.get("name", ""),
@@ -215,15 +219,26 @@ def ssh_url_to_port(url: str):
     return None
 
 
-def enrich_ssh_entries(entries: list) -> list:
-    """为 SSH 条目补充 port 字段。"""
+def enrich_ssh_entries(entries: list, task_ips: list = None) -> list:
+    """为 SSH 条目补充 port / pod_ip / host_ip 字段。"""
+    task_ip_map = {}
+    for item in task_ips or []:
+        task = item.get("task", "")
+        if task:
+            task_ip_map[task] = item
+    fallback_ip = (task_ips or [{}])[0] if len(task_ips or []) == 1 else {}
+
     out = []
     for item in entries or []:
         url = item.get("url", "")
+        task = item.get("task", "")
+        ip_info = task_ip_map.get(task, fallback_ip)
         out.append({
-            "task": item.get("task", ""),
+            "task": task,
             "url": url,
             "port": ssh_url_to_port(url),
+            "pod_ip": ip_info.get("ip", ""),
+            "host_ip": ip_info.get("host_ip", ""),
         })
     return out
 

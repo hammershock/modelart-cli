@@ -366,9 +366,12 @@ class API:
         return False
 
     def get_ssh(self, job: dict) -> list:
-        """从详情中提取 SSH 信息，路径: endpoints.ssh.task_urls[].url，并补充 port。"""
+        """从详情中提取 SSH 信息，并补充 port / pod_ip / host_ip。"""
         try:
-            return enrich_ssh_entries(job.get("endpoints", {}).get("ssh", {}).get("task_urls", []))
+            return enrich_ssh_entries(
+                job.get("endpoints", {}).get("ssh", {}).get("task_urls", []),
+                job.get("status", {}).get("task_ips", []),
+            )
         except Exception:
             return []
 
