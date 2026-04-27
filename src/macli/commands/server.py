@@ -313,6 +313,18 @@ def _server_run(args):
             return "yellow"
         return "green"
 
+    def _disk_level(value, thresholds: tuple) -> str:
+        if value is None:
+            return "unknown"
+        yellow, orange, red = thresholds
+        if value >= red:
+            return "red"
+        if value >= orange:
+            return "orange"
+        if value >= yellow:
+            return "yellow"
+        return "green"
+
     def _disk_cell(value, thresholds: tuple, use_ansi: bool, pct_symbol_only: bool = False):
         text = _disk_pct_text(value)
         if not use_ansi:
@@ -371,9 +383,19 @@ def _server_run(args):
             created   = _fmt_created(r.get("create_time"))
             dur       = _fmt_dur(r.get("duration_ms"))
             disk_info = disk_idx.get(job_id, {})
-            alloc = _disk_cell(disk_info.get("alloc_pct"), (50, 70, 85), use_ansi)
-            share = _disk_cell(disk_info.get("share_pct"), (10, 30, 50),
+            alloc_value = disk_info.get("alloc_pct")
+            share_value = disk_info.get("share_pct")
+            alloc = _disk_cell(alloc_value, (50, 70, 85), use_ansi)
+            share = _disk_cell(share_value, (10, 30, 50),
                                use_ansi, pct_symbol_only=True)
+            if use_ansi:
+                alloc_level = _disk_level(alloc_value, (50, 70, 85))
+                share_level = _disk_level(share_value, (10, 30, 50))
+                if alloc_level == "red" and share_level == "red":
+                    flag = "🚨"
+                    ssh = _RText(str(ssh), style="red")
+                elif {alloc_level, share_level} == {"red", "orange"}:
+                    ssh = _RText(str(ssh), style="orange1")
             row_base = [flag, job_short, ssh, cpu, mem, created, dur]
             if not devs:
                 row = row_base + ["—"]
