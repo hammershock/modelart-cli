@@ -531,12 +531,28 @@ def _server_run(args):
             "default_identityfile": idf_default,
         }
 
+        # ── disk ──────────────────────────────────────────
+        import shutil as _shutil
+        disk = {}
+        for _dname, _dpath in [("overlay", "/"), ("cache", "/cache")]:
+            try:
+                _st = _shutil.disk_usage(_dpath)
+                disk[_dname] = {
+                    "total_gb": round(_st.total / 1024**3, 1),
+                    "used_gb":  round(_st.used / 1024**3, 1),
+                    "avail_gb": round(_st.free / 1024**3, 1),
+                    "used_pct": round(_st.used / _st.total * 100, 1),
+                }
+            except OSError:
+                pass
+
         return {
             "login":    login,
             "server":   server,
             "watch":    watch,
             "autologin": autologin,
             "exec":     exec_info,
+            "disk":     disk,
         }
 
     def _render_health(data: dict, last_run_ts: float, jobs: list, browser: bool) -> str:
@@ -646,6 +662,23 @@ def _server_run(args):
                 lines.append(f"  Circuit      {dot(True)}normal  ({failures}/{threshold} failures)")
             lines.append("")
 
+            # ── disk ──────────────────────────────────────
+            disk = data.get("disk", {})
+            if disk:
+                lines.append("Disk")
+                for dname, dinfo in disk.items():
+                    pct = dinfo.get("used_pct", 0)
+                    used = dinfo.get("used_gb", 0)
+                    total = dinfo.get("total_gb", 0)
+                    if total >= 1024:
+                        size_str = f"{used/1024:.1f}/{total/1024:.1f} TB"
+                    else:
+                        size_str = f"{used:.0f}/{total:.0f} GB"
+                    label = "/" if dname == "overlay" else f"/{dname}"
+                    warn = "  CRITICAL" if pct >= 90 else ("  WARNING" if pct >= 80 else "")
+                    lines.append(f"  {label:<10} {size_str:<18} {pct:.0f}%{warn}")
+                lines.append("")
+
             return "\n".join(lines)
 
         # ── 紧凑模式（ANSI 彩色，供 terminal/curl 显示）─────────
@@ -698,7 +731,24 @@ def _server_run(args):
         c_label  = f"tripped {failures}/{threshold}" if tripped else f"{failures}/{threshold}"
         line3    = f"Autologin {dot(al_on)} {channel}{al_last}  {cd} {c_label}"
 
-        return f"{line1}\n{line2}\n{line3}\n"
+        # ── disk compact ──────────────────────────────────
+        disk = data.get("disk", {})
+        disk_parts = []
+        for dname, dinfo in disk.items():
+            pct = dinfo.get("used_pct", 0)
+            label = "/" if dname == "overlay" else f"/{dname}"
+            if pct >= 90:
+                disk_parts.append(f"{label} {RED}{pct:.0f}%{R}")
+            elif pct >= 80:
+                disk_parts.append(f"{label} {Y}{pct:.0f}%{R}")
+            else:
+                disk_parts.append(f"{label} {G}{pct:.0f}%{R}")
+        line4 = f"Disk  {'  '.join(disk_parts)}" if disk_parts else ""
+
+        lines = [line1, line2, line3]
+        if line4:
+            lines.append(line4)
+        return "\n".join(lines) + "\n"
 
     @app.get("/health.json")
     def health():
