@@ -285,6 +285,7 @@ def _server_run(args):
             total = int(df.get("total_bytes") or 0)
             evict_limit = int(total * 0.9)
             alloc_pct = used / evict_limit * 100 if evict_limit > 0 else None
+            margin_bytes = evict_limit - used if evict_limit > 0 else None
             for job in host.get("jobs", []):
                 job_id = job.get("id")
                 if not job_id:
@@ -295,6 +296,7 @@ def _server_run(args):
                 idx[job_id] = {
                     "alloc_pct": alloc_pct,
                     "share_pct": share_pct,
+                    "margin_bytes": margin_bytes,
                 }
         return idx
 
@@ -335,6 +337,26 @@ def _server_run(args):
             return cell
         return _RText(text, style=_disk_style(value, thresholds))
 
+    def _disk_bytes_text(value) -> str:
+        if value is None:
+            return "—"
+        sign = "-" if value < 0 else ""
+        n = abs(float(value))
+        for factor, suffix in ((1024 ** 4, "TB"), (1024 ** 3, "GB"),
+                               (1024 ** 2, "MB"), (1024, "KB")):
+            if n >= factor:
+                v = n / factor
+                digits = 1 if v < 10 else 0
+                text = f"{v:.{digits}f}".rstrip("0").rstrip(".")
+                return f"{sign}{text}{suffix}"
+        return f"{sign}{int(n)}B"
+
+    def _disk_bytes_cell(value, alloc_value, use_ansi: bool):
+        text = _disk_bytes_text(value)
+        if not use_ansi:
+            return text
+        return _RText(text, style=_disk_style(alloc_value, (50, 70, 85)))
+
     def _render_jobs(jobs: list, use_ansi: bool, disk: dict = None) -> str:
         if not jobs:
             return "No running jobs.\n"
@@ -355,7 +377,7 @@ def _server_run(args):
 
         buf = _StringIO()
         con = _RConsole(file=buf, force_terminal=use_ansi, force_jupyter=False,
-                        highlight=False, markup=False, width=140,
+                        highlight=False, markup=False, width=152,
                         color_system="truecolor" if use_ansi else None)
         tbl = _RTable(show_header=True,
                       header_style="bold cyan" if use_ansi else "",
@@ -371,6 +393,7 @@ def _server_run(args):
             tbl.add_column(col, **kw)
         if show_disk:
             tbl.add_column("alloc%", width=8, no_wrap=True)
+            tbl.add_column("margin", width=9, no_wrap=True)
             tbl.add_column("share%", width=8, no_wrap=True)
         for r in jobs:
             devs      = r.get("gpu_devices", [])
@@ -385,7 +408,9 @@ def _server_run(args):
             disk_info = disk_idx.get(job_id, {})
             alloc_value = disk_info.get("alloc_pct")
             share_value = disk_info.get("share_pct")
+            margin_value = disk_info.get("margin_bytes")
             alloc = _disk_cell(alloc_value, (50, 70, 85), use_ansi)
+            margin = _disk_bytes_cell(margin_value, alloc_value, use_ansi)
             share = _disk_cell(share_value, (10, 30, 50),
                                use_ansi, pct_symbol_only=True)
             if use_ansi:
@@ -400,7 +425,7 @@ def _server_run(args):
             if not devs:
                 row = row_base + ["—"]
                 if show_disk:
-                    row += [alloc, share]
+                    row += [alloc, margin, share]
                 tbl.add_row(*row)
             else:
                 for i, d in enumerate(devs):
@@ -408,12 +433,12 @@ def _server_run(args):
                     if i == 0:
                         row = row_base + [cell]
                         if show_disk:
-                            row += [alloc, share]
+                            row += [alloc, margin, share]
                         tbl.add_row(*row)
                     else:
                         row = ["", "", "", "", "", "", "", cell]
                         if show_disk:
-                            row += ["", ""]
+                            row += ["", "", ""]
                         tbl.add_row(*row)
         con.print(tbl)
         body = buf.getvalue()

@@ -234,7 +234,7 @@ def collect_disk_state(max_workers: int = 4):
         state["errors"].append("no running jobs with ssh ports")
         save_disk_state(state)
         warn("磁盘监控：没有可检查的 Running SSH 作业")
-        return
+        return state
 
     # Avoid concurrent macli exec processes racing on session.json by setting
     # the remembered backend once before launching probes.
@@ -290,6 +290,7 @@ def collect_disk_state(max_workers: int = 4):
     save_disk_state(state)
     ok_count = sum(1 for r in results if r.get("ok"))
     info(f"磁盘监控完成：hosts={len(state['hosts'])} jobs={ok_count}/{len(targets)}")
+    return state
 
 def save_disk_state(state: dict):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -297,12 +298,26 @@ def save_disk_state(state: dict):
         json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8"
     )
 
+def maybe_send_disk_alert(disk_state: dict):
+    if not disk_state:
+        return
+    try:
+        from macli.mail_alert import send_disk_alert_if_needed
+        sent, reason, risks = send_disk_alert_if_needed(disk_state)
+        if sent:
+            info(f"磁盘告警邮件已发送：风险作业 {len(risks)} 个")
+        elif risks:
+            info(f"磁盘告警邮件未发送：{reason}（风险作业 {len(risks)} 个）")
+    except Exception as exc:
+        error(f"磁盘告警邮件失败：{type(exc).__name__}: {exc}")
+
 # ── 检查逻辑 ──────────────────────────────────────────────────
 def check(threshold_hours: int = DEFAULT_THRESHOLD_H):
     now   = datetime.now(timezone.utc)
+    disk_state = None
 
     try:
-        collect_disk_state()
+        disk_state = collect_disk_state()
     except Exception as exc:
         error(f"磁盘监控失败：{type(exc).__name__}: {exc}")
 
@@ -311,6 +326,7 @@ def check(threshold_hours: int = DEFAULT_THRESHOLD_H):
 
     if not jobs and not state.get("terminated_times"):
         warn("无法获取作业列表，跳过本次检查")
+        maybe_send_disk_alert(disk_state)
         return
 
     pending    = [j for j in jobs if j.get("status", "") in PENDING_PHASES]
@@ -400,6 +416,7 @@ def check(threshold_hours: int = DEFAULT_THRESHOLD_H):
     state["terminated_times"] = term_times
     state["last_check"]       = now.strftime("%Y-%m-%dT%H:%M:%SZ")
     save_state(state)
+    maybe_send_disk_alert(disk_state)
     info("本次检查完成")
 
 

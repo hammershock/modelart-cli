@@ -36,6 +36,10 @@ def save_session(data: dict):
     p = _config_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        p.chmod(0o600)
+    except OSError:
+        pass
 
 
 # ── 通用子域配置 helper ──────────────────────────────────────
@@ -55,6 +59,7 @@ def _save_cfg_section(key: str, cfg):
 _AUTOLOGIN_KEY = "auto_login"
 _WATCH_KEY     = "watch"
 _SERVER_KEY    = "server"
+_ALERT_EMAIL_KEY = "alert_email"
 
 
 def load_auto_login_cfg() -> dict:
@@ -74,6 +79,12 @@ def load_server_cfg() -> dict:
 
 def save_server_cfg(cfg: dict):
     _save_cfg_section(_SERVER_KEY, cfg)
+
+def load_alert_email_cfg() -> dict:
+    return _load_cfg_section(_ALERT_EMAIL_KEY)
+
+def save_alert_email_cfg(cfg: dict):
+    _save_cfg_section(_ALERT_EMAIL_KEY, cfg)
 
 
 # ── SSH 密钥管理 ─────────────────────────────────────────────
