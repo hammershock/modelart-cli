@@ -1,7 +1,9 @@
 import sys, time
 from macli.constants import STATUS_COLOR, console
 from macli.log import cprint, dprint
-from macli.helpers import _json_out, job_to_dict, ms_to_hms, ts_to_str, _fmt_flavor, _fmt_actual
+from macli.helpers import (_json_out, job_to_dict, ms_to_hms, ts_to_str,
+                           _fmt_flavor, _fmt_actual, _fetch_all_jobs,
+                           build_quota_annotations)
 from macli.session import _sess_or_exit, API
 from rich.table import Table
 from rich.panel import Panel
@@ -30,7 +32,13 @@ def cmd_detail(args):
         if not job: sys.exit(1)
 
     if getattr(args, "json", False):
-        _json_out(job_to_dict(job))
+        all_jobs = _fetch_all_jobs(api)
+        job_id = job.get("metadata", {}).get("id", "")
+        if job_id and not any(j.get("metadata", {}).get("id") == job_id
+                              for j in all_jobs):
+            all_jobs.append(job)
+        quota_map = build_quota_annotations(api, all_jobs)
+        _json_out(job_to_dict(job, quota=quota_map.get(job_id)))
         return
 
     meta  = job.get("metadata", {})

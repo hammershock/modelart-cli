@@ -7,7 +7,8 @@ from macli.constants import _CST, SessionExpiredError, console, Progress, TextCo
 from macli.config import get_exec_backend
 from macli.log import cprint, dprint, _raw_debug
 from macli.helpers import (PortCache, resolve_ssh, ssh_ports_summary,
-                           ms_to_hms, ts_to_str, _json_out, _fetch_all_jobs)
+                           ms_to_hms, ts_to_str, _json_out, _fetch_all_jobs,
+                           build_quota_annotations)
 from macli.session import _sess_or_exit, API
 from macli.commands.log_cmd import _pick_log_task
 from rich.panel import Panel
@@ -509,6 +510,8 @@ def cmd_usage(args):
     def _fetch_one(job):
         meta        = job.get("metadata", {})
         st          = job.get("status",   {})
+        res         = job.get("spec", {}).get("resource", {})
+        pool_info   = res.get("pool_info", {})
         job_id      = meta.get("id", "")
         name        = meta.get("name", "")
         create_time = meta.get("create_time")          # ms timestamp
@@ -552,6 +555,9 @@ def cmd_usage(args):
         return {
             "job_id":       job_id,
             "name":         name,
+            "status":       st.get("phase", "Running"),
+            "pool_id":      res.get("pool_id") or pool_info.get("pool_id", ""),
+            "gpu_count":    pool_info.get("accelerator_num") or 1,
             "ssh_port":     ssh_port,
             "create_time":  int(create_time) if create_time is not None else 0,
             "duration_ms":  int(duration_ms) if duration_ms is not None else 0,
@@ -589,9 +595,11 @@ def cmd_usage(args):
     )
 
     # 为 JSON/显示补充格式化字段
+    quota_map = build_quota_annotations(api, rows)
     for r in rows:
         r["create_time_str"] = ts_to_str(r["create_time"]) if r["create_time"] else "--"
         r["duration_str"]    = ms_to_hms(r["duration_ms"])  if r["duration_ms"]  else "--"
+        r.update(quota_map.get(r.get("job_id"), {}))
 
     if getattr(args, "json", False):
         _json_out({

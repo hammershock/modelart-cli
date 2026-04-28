@@ -4,7 +4,7 @@ from macli.log import cprint, dprint
 from macli.helpers import (_json_out, job_to_dict, ms_to_hms, ts_to_str,
                            ssh_ports_list, ssh_ports_summary,
                            _resolve_jobs_ssh_map, _apply_job_filters,
-                           _fetch_all_jobs)
+                           _fetch_all_jobs, build_quota_annotations)
 from macli.session import _sess_or_exit, API
 from rich.table import Table
 
@@ -18,9 +18,11 @@ def cmd_list_jobs(args):
                        or args.terminated or args.pending or args.gpu_count
                        or args.name or args.status)
     if need_filter:
-        jobs = _fetch_all_jobs(api)
+        all_jobs_for_quota = _fetch_all_jobs(api)
+        jobs = all_jobs_for_quota
         total = len(jobs)
     else:
+        all_jobs_for_quota = None
         PAGE = 50
         jobs     = []
         total    = 0
@@ -48,10 +50,17 @@ def cmd_list_jobs(args):
     ssh_map = _resolve_jobs_ssh_map(api, jobs, refresh=getattr(args, "refresh", False))
 
     if getattr(args, "json", False):
+        if all_jobs_for_quota is None:
+            all_jobs_for_quota = _fetch_all_jobs(api)
+        quota_map = build_quota_annotations(api, all_jobs_for_quota)
         out = []
         for j in jobs:
             job_id = j.get("metadata", {}).get("id", "")
-            out.append(job_to_dict(j, ssh_override=ssh_map.get(job_id, [])))
+            out.append(job_to_dict(
+                j,
+                ssh_override=ssh_map.get(job_id, []),
+                quota=quota_map.get(job_id),
+            ))
         _json_out(out)
         return
 
@@ -153,6 +162,7 @@ def cmd_ports(args):
     jobs = [j for j in _fetch_all_jobs(api)
             if j.get("status", {}).get("phase", "") == "Running"]
     ssh_map = _resolve_jobs_ssh_map(api, jobs, refresh=getattr(args, "refresh", False))
+    quota_map = build_quota_annotations(api, jobs)
 
     if getattr(args, "json", False):
         out = []
@@ -169,6 +179,7 @@ def cmd_ports(args):
                 "gpu_count":   res.get("pool_info", {}).get("accelerator_num") or 1,
                 "ports":       ssh_ports_list(ssh),
                 "ssh":         ssh,
+                **(quota_map.get(job_id) or {}),
             })
         _json_out(out)
         return
@@ -183,15 +194,20 @@ def cmd_ports(args):
     t.add_column("名称", style="green", no_wrap=True, max_width=24)
     t.add_column("ID", style="dim", no_wrap=True, width=40)
     t.add_column("SSH端口", width=18)
+    t.add_column("配额", width=4)
 
     for i, j in enumerate(jobs, 1):
         meta = j.get("metadata", {})
         job_id = meta.get("id", "")
+        quota_class = (quota_map.get(job_id) or {}).get("quota_class", "unknown")
+        quota_tag = {"guaranteed": "保", "elastic": "弹",
+                     "unknown": "?", "inactive": "-"}.get(quota_class, "?")
         t.add_row(
             str(i),
             meta.get("name", ""),
             job_id,
             ssh_ports_summary(ssh_map.get(job_id, [])),
+            quota_tag,
         )
     console.print(t)
     if getattr(args, "refresh", False):

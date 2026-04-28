@@ -364,17 +364,6 @@ def _server_run(args):
         disk_idx = _disk_job_index(disk)
         show_disk = bool(disk)
 
-        # 按创建时间升序累计 GPU 数，最先占满配额的任务为稳定主机
-        _GPU_QUOTA = 8
-        sorted_asc = sorted(jobs, key=lambda r: r.get("create_time") or 0)
-        stable_ids: set = set()
-        _used = 0
-        for r in sorted_asc:
-            n = len(r.get("gpu_devices") or []) or 1
-            if _used + n <= _GPU_QUOTA:
-                stable_ids.add(r.get("job_id"))
-            _used += n
-
         buf = _StringIO()
         con = _RConsole(file=buf, force_terminal=use_ansi, force_jupyter=False,
                         highlight=False, markup=False, width=152,
@@ -399,7 +388,13 @@ def _server_run(args):
             devs      = r.get("gpu_devices", [])
             job_id    = r.get("job_id") or "?"
             job_short = job_id[:8]
-            flag      = "🏠" if job_id in stable_ids else "🔴"
+            quota_class = r.get("quota_class", "unknown")
+            flag      = {
+                "guaranteed": "🏠",
+                "elastic": "🔴",
+                "unknown": "?",
+                "inactive": "-",
+            }.get(quota_class, "?")
             ssh       = r.get("ssh_port") or "—"
             cpu       = _fmt_pct(r.get("cpu"))
             mem       = _fmt_mem(r.get("mem"))
@@ -560,15 +555,6 @@ def _server_run(args):
             age = 0.0
         with _cache_lock:
             jobs = list(_cache["jobs"])
-        _GPU_QUOTA = 8
-        sorted_asc = sorted(jobs, key=lambda r: r.get("create_time") or 0)
-        stable_ids: set = set()
-        _used = 0
-        for r in sorted_asc:
-            n = len(r.get("gpu_devices") or []) or 1
-            if _used + n <= _GPU_QUOTA:
-                stable_ids.add(r.get("job_id"))
-            _used += n
         out = []
         for r in jobs:
             devices = []
@@ -578,9 +564,16 @@ def _server_run(args):
                 vram_tot  = d.get("vram_total_mb") or 1
                 idle = ((util or 0) * 100 == 0 and vram_used / vram_tot * 100 < 3)
                 devices.append({**d, "idle": idle})
-            out.append({**r,
-                        "preemptible": r.get("job_id") not in stable_ids,
-                        "gpu_devices": devices})
+            row = {**r, "gpu_devices": devices}
+            if "quota_class" not in row:
+                row.update({
+                    "quota_class": "unknown",
+                    "quota_labels": ["unknown", "preemptible"],
+                    "quota_reason": "quota metadata unavailable",
+                })
+            if "preemptible" not in row:
+                row["preemptible"] = row.get("quota_class") != "guaranteed"
+            out.append(row)
         from fastapi.responses import JSONResponse as _JResp
         return _JResp(content=out, headers={"X-Cache-Age": str(round(age, 1))})
 
@@ -1029,17 +1022,18 @@ def _server_run(args):
             return []
 
         data, age = _ports_cache.get(_fetch_ports)
-        # 按创建时间累计 GPU 数，标记稳定/临时
-        _GPU_QUOTA = 8
-        sorted_asc = sorted(data, key=lambda r: r.get("create_time") or 0)
-        stable_ids: set = set()
-        _used = 0
-        for r in sorted_asc:
-            n = r.get("gpu_count") or 1
-            if _used + n <= _GPU_QUOTA:
-                stable_ids.add(r.get("id"))
-            _used += n
-        enriched = [{**r, "preemptible": r.get("id") not in stable_ids} for r in data]
+        enriched = []
+        for r in data:
+            row = dict(r)
+            if "quota_class" not in row:
+                row.update({
+                    "quota_class": "unknown",
+                    "quota_labels": ["unknown", "preemptible"],
+                    "quota_reason": "quota metadata unavailable",
+                })
+            if "preemptible" not in row:
+                row["preemptible"] = row.get("quota_class") != "guaranteed"
+            enriched.append(row)
         from fastapi.responses import JSONResponse as _JResp
         return _JResp(content=enriched,
                       headers={"X-Cache-Age": str(age)})

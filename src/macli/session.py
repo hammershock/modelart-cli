@@ -270,6 +270,47 @@ class API:
         cprint(f"[red]CloudShell 状态查询失败 {r.status_code}: {r.text[:200]}[/red]")
         return {}
 
+    def get_resource_pool(self, pool_id: str) -> dict:
+        url = (
+            f"{CONSOLE_BASE}/modelarts/rest/resourcePool/v2/"
+            f"{self.sess.project_id}/pools/{pool_id}"
+        )
+        r = self.sess._checked_request("get", url, timeout=20)
+        if r.status_code == 200:
+            return self._safe_json(r)
+        dprint(f"[dim]资源池查询失败 {r.status_code}: {r.text[:200]}[/dim]")
+        return {}
+
+    def get_pool_runtime_metrics(self, workspace_id: str = None) -> dict:
+        url = (
+            f"{CONSOLE_BASE}/modelarts/rest/resourcePool/v2/"
+            f"{self.sess.project_id}/metrics/runtime/pools"
+        )
+        params = {}
+        if workspace_id:
+            params["workspaceId"] = workspace_id
+        r = self.sess._checked_request(
+            "get", url, params=params or None, timeout=20
+        )
+        if r.status_code == 200:
+            return self._safe_json(r)
+        dprint(f"[dim]资源池运行指标查询失败 {r.status_code}: {r.text[:200]}[/dim]")
+        return {}
+
+    def list_resource_flavors(self, limit: int = 500) -> list:
+        url = (
+            f"{CONSOLE_BASE}/modelarts/rest/resourcePool/v1/"
+            f"{self.sess.project_id}/resourceflavors"
+        )
+        r = self.sess._checked_request(
+            "get", url, params={"limit": limit}, timeout=20
+        )
+        if r.status_code == 200:
+            data = self._safe_json(r)
+            return data.get("items", []) if isinstance(data, dict) else []
+        dprint(f"[dim]资源规格查询失败 {r.status_code}: {r.text[:200]}[/dim]")
+        return []
+
     # flavor_id 对应卡数
     FLAVOR_MAP = {
         1: "modelarts.pool.visual.xlarge",

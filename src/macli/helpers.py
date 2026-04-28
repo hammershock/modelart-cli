@@ -135,7 +135,7 @@ def parse_recent(s: str):
     return n * seconds * 1000  # 转毫秒
 
 
-def job_to_dict(j: dict, ssh_override: list = None) -> dict:
+def job_to_dict(j: dict, ssh_override: list = None, quota: dict = None) -> dict:
     """将 API 返回的 job 对象提炼为简洁的可序列化字典。
     ssh_override: 若传入，用此值替代 j 中的 endpoints.ssh（用于缓存注入场景）。
     """
@@ -150,7 +150,7 @@ def job_to_dict(j: dict, ssh_override: list = None) -> dict:
             j.get("endpoints", {}).get("ssh", {}).get("task_urls", []),
             st.get("task_ips", []),
         )
-    return {
+    out = {
         "id":          meta.get("id", ""),
         "name":        meta.get("name", ""),
         "status":      st.get("phase", ""),
@@ -165,6 +165,9 @@ def job_to_dict(j: dict, ssh_override: list = None) -> dict:
         "description": meta.get("description", ""),
         "ssh":         ssh,
     }
+    if quota:
+        out.update(quota)
+    return out
 
 
 def _json_out(data):
@@ -260,6 +263,279 @@ def ssh_ports_summary(entries: list) -> str:
     """用于表格展示 SSH 端口。多个端口去重后以逗号连接；缺失返回 —。"""
     ports = ssh_ports_list(entries)
     return ",".join(map(str, ports)) if ports else "—"
+
+
+_QUOTA_ACTIVE_PHASES = {"Running", "Pending", "Waiting"}
+
+
+def _to_int(value, default=None):
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def _quota_item_id(item: dict) -> str:
+    return (
+        item.get("job_id")
+        or item.get("id")
+        or item.get("metadata", {}).get("id", "")
+    )
+
+
+def _quota_item_name(item: dict) -> str:
+    return item.get("name") or item.get("metadata", {}).get("name", "")
+
+
+def _quota_item_phase(item: dict) -> str:
+    status = item.get("status")
+    if isinstance(status, dict):
+        return status.get("phase", "")
+    if isinstance(status, str):
+        return status
+    # usage --probe rows are produced only for running jobs.
+    if item.get("job_id"):
+        return "Running"
+    return ""
+
+
+def _quota_item_create_time(item: dict) -> int:
+    return _to_int(
+        item.get("create_time")
+        or item.get("metadata", {}).get("create_time"),
+        0,
+    )
+
+
+def _quota_item_pool_id(item: dict) -> str:
+    if item.get("pool_id"):
+        return item.get("pool_id")
+    res = item.get("spec", {}).get("resource", {})
+    return (
+        res.get("pool_id")
+        or res.get("pool_info", {}).get("pool_id", "")
+    )
+
+
+def _quota_item_gpu_count(item: dict) -> int:
+    n = _to_int(item.get("gpu_count"))
+    if n is not None and n > 0:
+        return n
+    devices = item.get("gpu_devices") or []
+    if devices:
+        return max(1, len(devices))
+    res = item.get("spec", {}).get("resource", {})
+    pool_info = res.get("pool_info", {})
+    per_node = _to_int(
+        pool_info.get("accelerator_num")
+        or res.get("main_container_allocated_resources", {}).get("accelerator_num"),
+        1,
+    )
+    node_count = _to_int(res.get("node_count"), 1)
+    return max(1, per_node * node_count)
+
+
+def _quota_base_labels(pool_id: str, guaranteed_gpu, max_gpu) -> list:
+    labels = ["fifo"]
+    if pool_id:
+        labels.append(f"pool:{pool_id}")
+    if guaranteed_gpu is not None or max_gpu is not None:
+        labels.append(f"quota:{guaranteed_gpu if guaranteed_gpu is not None else '?'}/"
+                      f"{max_gpu if max_gpu is not None else '?'}")
+    return labels
+
+
+def _quota_annotation(quota_class: str, preemptible: bool, labels: list,
+                      reason: str, rank=None, used_before=None, used_after=None,
+                      guaranteed_gpu=None, max_gpu=None) -> dict:
+    return {
+        "preemptible": preemptible,
+        "quota_class": quota_class,
+        "quota_labels": labels,
+        "quota_rank": rank,
+        "quota_used_before": used_before,
+        "quota_used_after": used_after,
+        "quota_guaranteed_gpu": guaranteed_gpu,
+        "quota_max_gpu": max_gpu,
+        "quota_reason": reason,
+    }
+
+
+def _pool_metrics_index(api: "API") -> dict:
+    workspace_id = getattr(api.sess, "workspace_id", None)
+    data = api.get_pool_runtime_metrics(workspace_id=workspace_id)
+    idx = {}
+    for item in data.get("items", []) if isinstance(data, dict) else []:
+        name = item.get("metadata", {}).get("name", "")
+        cap = item.get("table", {}).get("capacity", {})
+        value = cap.get("value", {}) or {}
+        max_value = cap.get("maxValue", {}) or {}
+        guaranteed = _to_int(value.get("nvidia.com/gpu"))
+        max_gpu = _to_int(max_value.get("nvidia.com/gpu"))
+        if name and guaranteed is not None:
+            idx[name] = {
+                "guaranteed_gpu": guaranteed,
+                "max_gpu": max_gpu,
+                "source": "metrics",
+            }
+    return idx
+
+
+def _resource_flavor_gpu_sizes(api: "API") -> dict:
+    sizes = {}
+    for item in api.list_resource_flavors():
+        name = item.get("metadata", {}).get("name", "")
+        spec = item.get("spec", {}) or {}
+        gpu = spec.get("gpu") or spec.get("npu") or {}
+        size = _to_int(gpu.get("size"))
+        if name and size is not None:
+            sizes[name] = size
+    return sizes
+
+
+def _pool_quota(api: "API", pool_id: str, metrics: dict,
+                flavor_sizes: dict = None) -> dict:
+    if pool_id in metrics:
+        q = dict(metrics[pool_id])
+        q["reason"] = "runtime metrics"
+        return q
+
+    pool = api.get_resource_pool(pool_id)
+    resources = pool.get("spec", {}).get("resources", []) if pool else []
+    if not resources:
+        return {"reason": "resource pool quota unavailable"}
+
+    if flavor_sizes is None:
+        flavor_sizes = _resource_flavor_gpu_sizes(api)
+
+    guaranteed = 0
+    max_gpu = 0
+    missing_flavors = []
+    for res in resources:
+        flavor = res.get("flavor", "")
+        gpu_size = flavor_sizes.get(flavor)
+        if gpu_size is None:
+            missing_flavors.append(flavor or "(unknown)")
+            continue
+        guaranteed += (_to_int(res.get("count"), 0) or 0) * gpu_size
+        max_gpu += (_to_int(res.get("maxCount"), 0) or 0) * gpu_size
+
+    if missing_flavors:
+        return {
+            "reason": "resource flavor GPU size unavailable: "
+                      + ",".join(missing_flavors)
+        }
+    return {
+        "guaranteed_gpu": guaranteed,
+        "max_gpu": max_gpu,
+        "source": "pool_spec",
+        "reason": "resource pool spec",
+    }
+
+
+def build_quota_annotations(api: "API", items: list) -> dict:
+    """按资源队列保障配额和 FIFO 顺序为作业/usage rows 生成保障标签。
+
+    返回 {job_id: quota_metadata}。无法读取配额时不回退到固定卡数。
+    """
+    result = {}
+    active_by_pool = {}
+
+    for item in items or []:
+        job_id = _quota_item_id(item)
+        if not job_id:
+            continue
+        phase = _quota_item_phase(item)
+        if phase not in _QUOTA_ACTIVE_PHASES:
+            result[job_id] = _quota_annotation(
+                "inactive", False, ["inactive"],
+                f"phase {phase or 'unknown'} is not active",
+            )
+            continue
+        pool_id = _quota_item_pool_id(item)
+        if not pool_id:
+            result[job_id] = _quota_annotation(
+                "unknown", True, ["unknown", "preemptible"],
+                "missing pool_id",
+            )
+            continue
+        active_by_pool.setdefault(pool_id, []).append(item)
+
+    if not active_by_pool:
+        return result
+
+    try:
+        metrics = _pool_metrics_index(api)
+    except Exception as e:
+        dprint(f"[dim]资源池运行指标不可用: {e}[/dim]")
+        metrics = {}
+
+    flavor_sizes = None
+    quota_cache = {}
+    for pool_id, pool_items in active_by_pool.items():
+        if pool_id not in quota_cache:
+            try:
+                quota_cache[pool_id] = _pool_quota(
+                    api, pool_id, metrics, flavor_sizes
+                )
+                if quota_cache[pool_id].get("source") != "metrics" and flavor_sizes is None:
+                    flavor_sizes = _resource_flavor_gpu_sizes(api)
+                    quota_cache[pool_id] = _pool_quota(
+                        api, pool_id, metrics, flavor_sizes
+                    )
+            except Exception as e:
+                quota_cache[pool_id] = {"reason": str(e)}
+        quota = quota_cache[pool_id]
+        guaranteed_gpu = quota.get("guaranteed_gpu")
+        max_gpu = quota.get("max_gpu")
+        base_labels = _quota_base_labels(pool_id, guaranteed_gpu, max_gpu)
+
+        if guaranteed_gpu is None:
+            for item in pool_items:
+                job_id = _quota_item_id(item)
+                result[job_id] = _quota_annotation(
+                    "unknown", True,
+                    ["unknown", "preemptible"] + base_labels,
+                    quota.get("reason", "resource pool quota unavailable"),
+                    guaranteed_gpu=guaranteed_gpu,
+                    max_gpu=max_gpu,
+                )
+            continue
+
+        used = 0
+        ordered = sorted(
+            pool_items,
+            key=lambda x: (_quota_item_create_time(x), _quota_item_id(x)),
+        )
+        for rank, item in enumerate(ordered, 1):
+            job_id = _quota_item_id(item)
+            need = _quota_item_gpu_count(item)
+            before = used
+            after = used + need
+            used = after
+            if after <= guaranteed_gpu:
+                labels = ["guaranteed", "stable"] + base_labels
+                reason = (f"FIFO rank {rank}: cumulative GPUs {after}/"
+                          f"{guaranteed_gpu} within guaranteed quota")
+                result[job_id] = _quota_annotation(
+                    "guaranteed", False, labels, reason,
+                    rank=rank, used_before=before, used_after=after,
+                    guaranteed_gpu=guaranteed_gpu, max_gpu=max_gpu,
+                )
+            else:
+                labels = ["elastic", "preemptible"] + base_labels
+                if max_gpu is not None and after > max_gpu:
+                    labels.append("over-max")
+                reason = (f"FIFO rank {rank}: cumulative GPUs {after} "
+                          f"exceeds guaranteed quota {guaranteed_gpu}")
+                result[job_id] = _quota_annotation(
+                    "elastic", True, labels, reason,
+                    rank=rank, used_before=before, used_after=after,
+                    guaranteed_gpu=guaranteed_gpu, max_gpu=max_gpu,
+                )
+    return result
 
 
 def _resolve_jobs_ssh_map(api: "API", jobs: list, refresh: bool = False) -> dict:
