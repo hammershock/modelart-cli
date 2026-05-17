@@ -3,6 +3,12 @@ name: modelart-cli
 description: 通过 `macli` 命令行工具管理华为云 ModelArts
 ---
 
+### 环境定位：
+- “华为云远程”默认指华为云 ModelArts 训练作业 / 训练容器，不是 ECS
+- SSH 入口通常是 `dev-modelarts-cnnorth9.huaweicloud.com:<port>`；端口是 ModelArts 为 Running 作业暴露的临时映射，不是 ECS 实例 ID 或固定主机编号
+- 登录用户通常是 `ma-user`，进入的是训练作业容器（如 `worker-0`）；底层是 ModelArts 资源池调度的 Kubernetes Pod
+- `stable` / `preemptible` 是远程资源或作业的可用性标签，preemptible 可能被平台回收
+
 ### 命令选型：
 - login 登录
 - autologin 管理会话过期时的自动重新登录（含 ntfy 推送）

@@ -1,6 +1,6 @@
-# AGENT.md
+# CLAUDE.md
 
-This file provides guidance to coding agents when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
 
@@ -102,7 +102,7 @@ commands/            14 个命令模块，每个对应一组 CLI 子命令
 
 - **触发条件**：`vgpaas-kubernetes` 分区可用空间低于总容量的 **10%**（即 < 946 GiB，总量 9.3T）
 - **监控指标**：kubelet 的 `nodefs.available` 信号，监控的是整块物理分区，与单个容器无关
-- **驱逐选择**：节点磁盘压力下，kubelet 会综合 Pod 是否超过 request、priority、以及相对 request 的资源使用量选择驱逐对象；ModelArts 训练 Pod 的 ephemeral-storage request 通常为 0，因此高磁盘用量 Pod 风险更高
+- **驱逐选择**：同一物理节点上所有 Pod 均为 BestEffort，按 **ephemeral-storage 用量从大到小** 逐个驱逐，直到分区恢复到阈值以上
 - `/cache` 无配额保护，任何用户写入大量数据都会威胁整个节点
 
 ### 网络暴露

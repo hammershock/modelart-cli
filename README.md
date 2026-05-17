@@ -2,6 +2,10 @@
 
 华为云 ModelArts 远程管理 CLI
 
+## 环境定位
+
+`macli` 管理的是华为云 **ModelArts 训练作业 / 训练容器**，不是 ECS（弹性云服务器）。SSH 连接进入的是 ModelArts 为 Running 训练作业暴露的容器端口，例如 `dev-modelarts-cnnorth9.huaweicloud.com:<port>`；这里的端口号对应作业容器的临时映射，不是 ECS 实例 ID，也不是一台可长期运维的虚拟机。
+
 ## 安装
 
 ```bash
