@@ -1,5 +1,6 @@
 import sys, time
 from macli.constants import STATUS_COLOR, console
+from macli.config import load_identityfiles
 from macli.log import cprint, dprint
 from macli.helpers import (_json_out, job_to_dict, ms_to_hms, ts_to_str,
                            _fmt_flavor, _fmt_actual, _fetch_all_jobs,
@@ -61,6 +62,8 @@ def cmd_detail(args):
     ssh_list = api.get_ssh(job)
     if ssh_list:
         cprint("\n[bold green]🔑 SSH 连接[/bold green]")
+        identityfiles, default_identityfile = load_identityfiles()
+        identity_hint = identityfiles.get(default_identityfile, default_identityfile)
         for s in ssh_list:
             url = s["url"]
             port = s.get("port")
@@ -75,7 +78,10 @@ def cmd_detail(args):
                 inner = url[6:]
                 user, _, hp = inner.partition("@")
                 host, _, port = hp.partition(":")
-                cprint(f"  [bold cyan]ssh -p {port} -i ~/.ssh/KeyPair-liusonghua.pem {user}@{host}[/bold cyan]")
+                if identity_hint:
+                    cprint(f"  [bold cyan]ssh -p {port} -i {identity_hint} {user}@{host}[/bold cyan]")
+                else:
+                    cprint(f"  [bold cyan]ssh -p {port} {user}@{host}[/bold cyan]")
     else:
         cprint("\n[yellow]该作业暂无 SSH 信息（未运行或不是调试模式）[/yellow]")
 
