@@ -150,9 +150,13 @@ def _do_auto_login(cfg: dict) -> bool:
                 d["region"]       = old_region
                 d["project_id"]   = old_project
                 d["agency_id"]    = old_agency
-                d["workspace_id"] = old_workspace
+                if old_workspace:
+                    d["workspace_id"] = old_workspace
                 save_session(d)
-                dprint(f"[dim]已恢复 region={old_region} workspace={old_workspace}[/dim]")
+                dprint(
+                    f"[dim]已恢复 region={old_region} "
+                    f"workspace={d.get('workspace_id', '')}[/dim]"
+                )
 
             cprint("[bold green]✓ 自动重新登录成功[/bold green]")
             return True
@@ -232,6 +236,25 @@ def _me_probe(http, cftk) -> dict:
     return {}
 
 
+def _is_missing_auth_token_response(r) -> bool:
+    """判断 APIGW 是否因缺少 IAM token 拒绝请求。"""
+    if getattr(r, "status_code", None) != 401:
+        return False
+
+    text = getattr(r, "text", "") or ""
+    try:
+        data = r.json()
+        text = " ".join(str(data.get(k, "")) for k in ("error_code", "error_msg", "message"))
+    except Exception:
+        pass
+
+    text = text.lower()
+    return (
+        "apigw.0301" in text
+        and ("x-auth-token" in text or "authentication information" in text)
+    )
+
+
 def _fetch_workspaces(sess) -> list:
     """调用 workspaces 接口，返回 [{"id":..., "name":...}, ...]"""
     url = (f"https://console.huaweicloud.com/modelarts/rest/v1"
@@ -241,6 +264,13 @@ def _fetch_workspaces(sess) -> list:
         r = sess.http.get(url, timeout=15)
         if r.status_code == 200:
             return r.json().get("workspaces", [])
+        if _is_missing_auth_token_response(r):
+            raise SessionExpiredError(
+                "workspace API authentication failed: x-auth-token not found"
+            )
+        cprint(f"[yellow]获取工作空间失败: HTTP {r.status_code} {r.text[:200]}[/yellow]")
+    except SessionExpiredError:
+        raise
     except Exception as e:
         cprint(f"[yellow]获取工作空间失败: {e}[/yellow]")
     return []

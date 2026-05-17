@@ -11,7 +11,7 @@ description: 通过 `macli` 命令行工具管理华为云 ModelArts
 
 ### 命令选型：
 - login 登录
-- autologin 管理会话过期时的自动重新登录（含 ntfy 推送）
+- autologin 管理会话过期时的自动重新登录（webhook / ntfy 获取验证码）
 - watch 定时检查任务：保活（无 Pending 时自动复制）+ 清理 Terminated 作业
 - whoami 显示当前登录用户信息
 - region 切换和显示当前region
@@ -55,7 +55,7 @@ macli workspace select --name <WORKSPACE_NAME>
 macli workspace select --id <WORKSPACE_ID>
 
 macli autologin [status|enable|disable] [--retries N] [--timeout SECS] [--reset-topic]
-# status（默认）查看配置；enable/disable 开关自动重登；--reset-topic 重新生成 ntfy 推送 topic
+# status（默认）查看配置；enable/disable 开关自动重登；webhook 为推荐 OTP 通道，ntfy 可作为降级
 
 macli watch [status|enable|disable|run] [--interval H] [--script PATH] [--threshold-hours N]
 # status（默认）  查看运行状态和上次检查时间
@@ -65,12 +65,13 @@ macli watch [status|enable|disable|run] [--interval H] [--script PATH] [--thresh
 # --interval     检查间隔（小时），默认 1
 # --threshold-hours  Terminated 作业保留时长（小时），默认 72
 
-macli server [status|enable|disable|run] [--port PORT]
+macli server [status|enable|disable|run] [--port PORT] [--region REGION] [--workspace NAME | --workspace-id ID]
 # status（默认）  查看 server 运行状态
 # enable         注册 launchd 常驻服务（KeepAlive=true）
 # disable        卸载 launchd 服务
 # run            前台直接运行（调试用）
 # --port         监听端口，默认 8086
+# --region/--workspace  保存 server 默认 ModelArts 上下文；自动重登后恢复到该 region/workspace
 # HTTP 接口：
 #   GET /gpu          GPU 实时状态（macli usage --probe，10s 缓存）
 #   GET /ports        Running 作业 SSH 端口列表 JSON（30s 缓存）
@@ -180,7 +181,7 @@ macli exec e40422c7-f151-4cba-982f-957c368071e3 -- nvidia-smi  # 在容器内执
 macli exec e40422c7-f151-4cba-982f-957c368071e3 --script run.sh  # 执行本地脚本
 macli exec e40422c7-f151-4cba-982f-957c368071e3 --backend ssh -- nvidia-smi  # 通过 SSH 后端执行
 macli autologin enable  # 开启会话过期自动重登
-macli server enable --port 8086  # 启动 HTTP 状态服务（launchd 常驻）
+macli server enable --port 8086 --region cn-north-9 --workspace SAI2  # 启动 HTTP 状态服务并固定默认 workspace
 macli server status              # 查看 server 状态
 curl localhost:8086/health       # 查看 macli/watch/autologin/exec 状态 JSON
 curl localhost:8086/gpu          # 查看 GPU 实时状态（终端 ANSI 彩色）

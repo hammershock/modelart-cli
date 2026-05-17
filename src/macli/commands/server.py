@@ -70,6 +70,13 @@ def _server_status():
             cprint("[dim]server：未启用[/dim]")
     if cfg:
         cprint(f"  端口        : {port}")
+        if cfg.get("region"):
+            cprint(f"  默认 Region : {cfg.get('region')}")
+        if cfg.get("workspace_name") or cfg.get("workspace_id"):
+            ws = cfg.get("workspace_name") or "(未命名)"
+            wsid = cfg.get("workspace_id", "")
+            suffix = f" [dim]({wsid})[/dim]" if wsid else ""
+            cprint(f"  默认 Workspace : {ws}{suffix}")
         cprint(f"  /gpu        : http://localhost:{port}/gpu")
         cprint(f"  /ports      : http://localhost:{port}/ports")
         cprint(f"  /log        : http://localhost:{port}/log")
@@ -80,10 +87,33 @@ def _server_status():
 
 
 # ── enable ──────────────────────────────────────────────────────
+def _update_server_context_cfg(cfg: dict, args) -> dict:
+    region = getattr(args, "region", None)
+    workspace = getattr(args, "workspace", None)
+    workspace_id = getattr(args, "workspace_id", None)
+
+    if region is not None:
+        region = region.strip()
+        if region:
+            cfg["region"] = region
+    if workspace_id is not None:
+        workspace_id = workspace_id.strip()
+        if workspace_id:
+            cfg["workspace_id"] = workspace_id
+    if workspace is not None:
+        workspace = workspace.strip()
+        if workspace:
+            cfg["workspace_name"] = workspace
+            if workspace_id is None:
+                cfg.pop("workspace_id", None)
+    return cfg
+
+
 def _server_enable(args):
     port = getattr(args, "port", None) or load_server_cfg().get("port", 8086)
     cfg = load_server_cfg()
     cfg.update({"enabled": True, "port": port})
+    cfg = _update_server_context_cfg(cfg, args)
     save_server_cfg(cfg)
     if _IS_LINUX:
         if _server_daemon.linux_is_running():
@@ -131,6 +161,64 @@ def _server_disable():
     cfg["enabled"] = False
     save_server_cfg(cfg)
     cprint("[green]✓ server 已停用[/green]")
+
+
+def _apply_server_context_after_autologin() -> bool:
+    cfg = load_server_cfg()
+    target_region = (cfg.get("region") or "").strip()
+    target_workspace_id = (cfg.get("workspace_id") or "").strip()
+    target_workspace_name = (cfg.get("workspace_name") or "").strip()
+    if not any([target_region, target_workspace_id, target_workspace_name]):
+        return True
+
+    try:
+        from macli.auth import _me, _fetch_workspaces
+        from macli.session import ConsoleSession
+
+        sess = ConsoleSession()
+        if not sess.restore():
+            dprint("[yellow]server: 自动登录后无法恢复 session，跳过默认上下文校正[/yellow]")
+            return False
+
+        region = target_region or sess.region
+        me = _me(sess.http, region, sess.cftk, sess.agency_id)
+        project_id = me.get("projectId", "")
+        agency_id = me.get("id") or me.get("userId", "") or sess.agency_id
+        if not project_id:
+            dprint(f"[yellow]server: 无法获取 region={region} 的 project_id，跳过默认上下文校正[/yellow]")
+            return False
+
+        sess.region = region
+        sess.project_id = project_id
+        sess.agency_id = agency_id
+        sess._set_headers()
+
+        workspace_id = target_workspace_id
+        workspace_name = target_workspace_name
+        if not workspace_id and workspace_name:
+            workspaces = _fetch_workspaces(sess)
+            matched = next((ws for ws in workspaces if ws.get("name") == workspace_name), None)
+            if not matched:
+                dprint(f"[yellow]server: region={region} 中未找到 workspace={workspace_name}[/yellow]")
+                return False
+            workspace_id = matched.get("id", "")
+        if workspace_id:
+            sess.workspace_id = workspace_id
+
+        data = load_session()
+        data["region"] = region
+        data["project_id"] = project_id
+        data["agency_id"] = agency_id
+        if workspace_id:
+            data["workspace_id"] = workspace_id
+        save_session(data)
+
+        ws_note = f" workspace={workspace_name or workspace_id}" if workspace_id else ""
+        dprint(f"[dim]server: 已恢复默认上下文 region={region}{ws_note}[/dim]")
+        return True
+    except Exception as e:
+        dprint(f"[yellow]server: 默认上下文校正失败: {e}[/yellow]")
+        return False
 
 
 # ── run (FastAPI server, 阻塞) ──────────────────────────────────
@@ -461,6 +549,7 @@ def _server_run(args):
                 dprint("[dim]server: session 过期，触发自动登录[/dim]")
                 if _do_auto_login(al_cfg):
                     _autologin_record_outcome(True)
+                    _apply_server_context_after_autologin()
                     wcfg = load_watch_cfg()
                     if wcfg.get("enabled"):
                         sp = wcfg.get("script_path", "")

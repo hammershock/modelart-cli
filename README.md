@@ -25,7 +25,7 @@ macli identityfile add /path/to/your/sshidentityfile
 macli exec --backend ssh
 macli watch enable
 macli watch run
-macli server enable
+macli server enable --region cn-north-9 --workspace SAI2
 macli autologin enable
 
 macli jobs --running            # 列出运行中的作业
@@ -39,7 +39,7 @@ macli shell <JOB_ID>            # 打开交互终端
 | 命令 | 说明 |
 |------|------|
 | `login` / `logout` | 登录/退出 |
-| `autologin` | 会话过期自动重登（ntfy 推送验证码） |
+| `autologin` | 会话过期自动重登（webhook / ntfy 获取验证码） |
 | `jobs` / `query` | 列出/筛选作业，支持管道批量操作 |
 | `usage` | CPU / 内存 / GPU 实时监控 |
 | `shell` / `ssh` | 交互终端（CloudShell 或原生 SSH） |
@@ -61,6 +61,15 @@ macli shell <JOB_ID>            # 打开交互终端
 | `GET /log` | macli 主日志最近 1000 行 |
 | `GET /watch-log` | watch 定时脚本日志最近 1000 行 |
 | `GET /server-log` | HTTP 请求访问日志（含来源 IP） |
+
+`macli server enable --region cn-north-9 --workspace SAI2` 会把 server 的默认
+ModelArts 上下文保存到配置中。之后如果 `/gpu` 服务触发自动重新登录，server 会在
+重登成功后把 session 恢复到该 region/workspace，避免落到控制台默认区域或默认工作空间。
+如果 `/gpu` 显示 `No running jobs`，但 `macli jobs --running` 有结果，优先检查
+server 所在机器的 `macli whoami --json` 中 `workspace_id` 是否仍指向目标 workspace。
+
+当工作空间列表或作业列表接口返回 `APIGW.0301 / x-auth-token not found` 时，`macli`
+会把它识别为登录态失效并抛出登录异常；启用 `autologin` 后，该异常会交给自动重登流程处理。
 
 ## 要求
 

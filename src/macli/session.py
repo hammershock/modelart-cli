@@ -143,6 +143,21 @@ class API:
     def __init__(self, sess: ConsoleSession):
         self.sess = sess
 
+    def _is_missing_auth_token_response(self, r) -> bool:
+        if getattr(r, "status_code", None) != 401:
+            return False
+        text = getattr(r, "text", "") or ""
+        try:
+            data = r.json()
+            text = " ".join(str(data.get(k, "")) for k in ("error_code", "error_msg", "message"))
+        except Exception:
+            pass
+        text = text.lower()
+        return (
+            "apigw.0301" in text
+            and ("x-auth-token" in text or "authentication information" in text)
+        )
+
     def _safe_json(self, r):
         """安全解析响应 JSON。
         若解析失败（如响应体为空），自动检查登录状态：
@@ -170,6 +185,10 @@ class API:
         dprint(f"[dim]API list_jobs offset={offset} limit={limit} order={order} → {r.status_code}[/dim]")
         if r.status_code == 200:
             return self._safe_json(r)
+        if self._is_missing_auth_token_response(r):
+            raise SessionExpiredError(
+                "list jobs API authentication failed: x-auth-token not found"
+            )
         cprint(f"[red]列表失败 {r.status_code}: {r.text[:200]}[/red]")
         return {}
 
