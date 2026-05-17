@@ -45,8 +45,8 @@ commands/            14 个命令模块，每个对应一组 CLI 子命令
 - **API** 类是 ModelArts REST API 的薄封装，所有 job CRUD / metrics / exec 操作走这里
 - **PortCache** 线程安全的 SSH 端口缓存，Running 作业端口不变，持久化到 session.json
 - **DaemonManager** 统一了 watch 和 server 的 macOS launchd / Linux 进程管理代码
-- **auto-login**: `main()` 捕获 `SessionExpiredError` → 调用 `_do_auto_login()` → 成功后 `os.execvp` 重新执行原命令
-- **server** (`commands/server.py`): 内嵌 FastAPI 应用，通过子进程调用 `macli usage --probe --json` 采集数据，闭包内维护缓存
+- **auto-login**: `main()` 捕获 `SessionExpiredError` → 调用 `_do_auto_login()` → 成功后 `os.execvp` 重新执行原命令；APIGW 返回 `APIGW.0301 / x-auth-token not found` 时应转换为 `SessionExpiredError`，不能静默返回空列表
+- **server** (`commands/server.py`): 内嵌 FastAPI 应用，通过子进程调用 `macli usage --probe --json` 采集数据，闭包内维护缓存；server 可保存默认 region/workspace，并在自动重登后恢复该 ModelArts 上下文，避免 `/gpu` 落到默认 workspace 后显示空列表
 
 ### 配置存储
 
@@ -55,7 +55,8 @@ commands/            14 个命令模块，每个对应一组 CLI 子命令
 ## Development Notes
 
 - **Python >= 3.8**，运行时依赖仅 `requests` + `rich`（缺失时 `net._ensure_pkg()` 自动安装并重启进程）
-- **无测试套件**，无 linter 配置
+- 测试使用标准库 `unittest`，运行 `PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -v`
+- 无 linter 配置
 - `commands/exec_.py` 文件名用下划线后缀避免与 Python 关键字冲突
 - `scripts/check_jobs.py` 是 watch daemon 调用的独立脚本，有自己的 argparse，不属于 macli 包
 
@@ -63,7 +64,8 @@ commands/            14 个命令模块，每个对应一组 CLI 子命令
 
 远程华为云容器上部署时：
 - 用 `/temp/hanmo/tools/github_ssh_remote.sh pull <repo_dir>` 拉取代码（走 ssh.github.com:443）
-- `pip install .` 安装后 `macli server disable && macli server enable` 重载服务
+- `pip install .` 安装后用 `macli server enable --port 8086 --region cn-north-9 --workspace SAI2` 重载服务，并用 `macli watch enable --script <repo_dir>/scripts/check_jobs.py --threshold-hours 72 --interval 0.2` 重载 watch
+- 部署后检查 `macli whoami --json` 的 `workspace_id`，以及 `curl http://127.0.0.1:8086/gpu.json` 是否能看到 Running jobs；公网入口为 `http://123.56.30.71:8086/`
 - 不要写全局 git config（共享账号），用 repo-level config
 
 ## Huawei Cloud ModelArts 环境
