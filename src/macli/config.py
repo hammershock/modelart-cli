@@ -89,9 +89,46 @@ def save_alert_email_cfg(cfg: dict):
 
 # ── SSH 密钥管理 ─────────────────────────────────────────────
 
+def _migrate_identityfile_path(path: str) -> str:
+    """兼容旧的 ~/Documents/keys 目录，自动迁移到 ~/keys。"""
+    if not path:
+        return path
+    home = Path.home()
+    old_base = home / "Documents" / "keys"
+    new_base = home / "keys"
+    try:
+        expanded = Path(path).expanduser()
+        rel = expanded.relative_to(old_base)
+    except (OSError, ValueError):
+        return path
+
+    candidate = new_base / rel
+    if candidate.exists() or not expanded.exists():
+        return str(candidate)
+    return path
+
+
 def load_identityfiles() -> tuple:
     data = load_session()
-    return data.get("identityfiles", {}), data.get("default_identityfile", None)
+    files = data.get("identityfiles", {})
+    default = data.get("default_identityfile", None)
+
+    changed = False
+    migrated = {}
+    for name, path in files.items():
+        new_path = _migrate_identityfile_path(path)
+        migrated[name] = new_path
+        changed = changed or new_path != path
+    if default and (os.sep in default or default.startswith(".") or default.startswith("~")):
+        new_default = _migrate_identityfile_path(default)
+        changed = changed or new_default != default
+        default = new_default
+
+    if changed:
+        data["identityfiles"] = migrated
+        data["default_identityfile"] = default
+        save_session(data)
+    return migrated, default
 
 
 def save_identityfiles(files: dict, default: str = None):

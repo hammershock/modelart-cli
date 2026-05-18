@@ -45,10 +45,9 @@ def cmd_ssh(args):
         ssh_list, task=args.task,
         identityfile=getattr(args, "identityfile", None),
         ssh_opts=getattr(args, "ssh_opts", None),
+        batch_mode=False,
     )
     ssh_cmd = ssh_base + [f"{user}@{host}"]
-    # ssh mode: no remote command (interactive shell), drop BatchMode
-    ssh_cmd = [a for a in ssh_cmd if a != "BatchMode=yes"]
 
     cprint(f"[dim]连接：{entry['task']}  {' '.join(ssh_cmd)}[/dim]")
     os.execvp("ssh", ssh_cmd)

@@ -119,7 +119,8 @@ def _exec_script(
 
 
 def _build_ssh_cmd(ssh_entries: list, task: str = None,
-                   identityfile: str = None, ssh_opts: list = None) -> "tuple[list, str, str, int]":
+                   identityfile: str = None, ssh_opts: list = None,
+                   batch_mode: bool = True) -> "tuple[list, str, str, int]":
     """构造 SSH 命令基础参数，返回 (ssh_base_cmd, user, host, port)。
     ssh_entries 为已 enrich 的列表（来自 resolve_ssh）。
     """
@@ -148,7 +149,9 @@ def _build_ssh_cmd(ssh_entries: list, task: str = None,
     identity_path = resolve_identityfile(identityfile)
     cmd = ["ssh", "-p", str(port), "-i", identity_path,
            "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-           "-o", "LogLevel=ERROR", "-o", "BatchMode=yes"]
+           "-o", "LogLevel=ERROR"]
+    if batch_mode:
+        cmd += ["-o", "BatchMode=yes"]
     if ssh_opts:
         cmd += ssh_opts
     return cmd, user, host, port
